@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/diamy-mail-crypto",
+  "crates/diamy-mail-model",
+  "crates/diamy-mail-iam",
+  "crates/diamy-addr",
+  "crates/diamy-obs",
+  "services/diamy-mxd",
+  "services/diamy-maild",
+  "services/diamy-submitd",
+  # "services/diamy-cald",   # active-le quand tu attaques l'agenda (A12-A15)
+]
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+authors = ["W3TEL / TEQTEL"]
+
+[workspace.dependencies]
+# Communes
+thiserror = "1"
+zeroize = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v7"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prometheus = "0.14"
+
+# Backend `dev-crypto` UNIQUEMENT — primitives auditees RustCrypto, JAMAIS en prod.
+# Cible = primitives du messaging Diamy (backend `messaging-crypto`).
+aes-gcm = "0.10"                       # AES-256-GCM (contenu + wrap)
+hkdf = "0.12"                          # HKDF-SHA256 (derivation de cle)
+sha2 = "0.10"
+ml-kem = "0.2"                         # ML-KEM-768 FIPS 203 (enveloppe par appareil)
+ed25519-dalek = { version = "2", features = ["rand_core"] }  # stand-in dev de ML-DSA-65
+rand = "0.8"
+
+# Normalisation d'adresse (A24)
+idna = "0.5"
+unicode-normalization = "0.1"

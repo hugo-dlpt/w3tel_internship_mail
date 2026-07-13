@@ -1,0 +1,14 @@
+[package]
+name = "diamy-mxd"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Passerelle entrante + chiffrement frontière (A01). Démo du chemin vertical de la maquette."
+
+[dependencies]
+diamy-mail-crypto = { path = "../../crates/diamy-mail-crypto" }
+diamy-mail-model = { path = "../../crates/diamy-mail-model" }
+diamy-mail-iam = { path = "../../crates/diamy-mail-iam" }
+diamy-obs = { path = "../../crates/diamy-obs" }
+tracing.workspace = true
+uuid.workspace = true

@@ -1,0 +1,22 @@
+//! `diamy-submitd` — envoi sortant (A10) : copie « Envoyés » chiffrée côté client,
+//! signature DKIM, rate limits par expéditeur/tenant, gestion de réputation/pools d'IP.
+//!
+//! Squelette. Rappels normatifs à respecter dès l'implémentation :
+//!   - SEC-OUT-2 : pas d'envoi tant que SPF/DKIM/DMARC ne sont pas alignés (fail-closed).
+//!   - SEC-OUT-1 : rate limit par expéditeur + compteur de destinataires uniques + circuit-breaker.
+
+use diamy_mail_crypto as crypto;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    diamy_obs::init_tracing();
+    let env = std::env::var("DIAMY_ENV").unwrap_or_else(|_| "dev".to_string());
+    crypto::assert_backend_allowed_for_env(&env)?;
+    tracing::info!(
+        service = "diamy-submitd",
+        backend = crypto::backend_name(),
+        env = %env,
+        "squelette — chemin sortant non implémenté (A10)"
+    );
+    println!("diamy-submitd : squelette. À implémenter : A10 (DKIM, rate limit, pools). SEC-OUT-2 fail-closed.");
+    Ok(())
+}

@@ -1,0 +1,11 @@
+[package]
+name = "diamy-mail-iam"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Client de consommation Diamy IAM (A17). Ne réimplémente JAMAIS identité/session/clés (INV-9)."
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
+diamy-addr = { path = "../diamy-addr" }

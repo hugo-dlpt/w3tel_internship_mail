@@ -1,0 +1,12 @@
+[package]
+name = "diamy-maild"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Stockage + sync + annuaire de clés (A02, A04, A17). Ici : squelette + endpoint /metrics."
+
+[dependencies]
+diamy-mail-crypto = { path = "../../crates/diamy-mail-crypto" }
+diamy-obs = { path = "../../crates/diamy-obs" }
+tokio.workspace = true
+tracing.workspace = true

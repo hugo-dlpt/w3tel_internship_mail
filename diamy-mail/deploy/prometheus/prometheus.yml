@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: diamy-mail
+    static_configs:
+      # `diamy-maild` lancé sur l'hôte via `cargo run -p diamy-maild` (port 9101).
+      # Depuis le conteneur Prometheus, l'hôte est `host.docker.internal`.
+      - targets: ["host.docker.internal:9101"]

@@ -1,0 +1,25 @@
+[package]
+name = "diamy-mail-crypto"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "LA seule maison de la crypto Diamy Mail (INV-5). API stable, backend interchangeable."
+
+[dependencies]
+thiserror.workspace = true
+zeroize.workspace = true
+
+# --- optionnelles : uniquement pour le backend dev-crypto ---
+aes-gcm = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+ml-kem = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+
+[features]
+default = ["dev-crypto"]
+# Backend de developpement : primitives auditees RustCrypto. NON EXPEDIABLE.
+dev-crypto = ["dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:ml-kem", "dep:ed25519-dalek", "dep:rand"]
+# Backend cible : primitives du messaging Diamy (a brancher quand le messaging est stable).
+messaging-crypto = []

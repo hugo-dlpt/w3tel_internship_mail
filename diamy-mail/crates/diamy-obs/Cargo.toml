@@ -1,0 +1,11 @@
+[package]
+name = "diamy-obs"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Logs structurés (sans contenu, INV-21) + métriques Prometheus + santé (A22)."
+
+[dependencies]
+prometheus.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

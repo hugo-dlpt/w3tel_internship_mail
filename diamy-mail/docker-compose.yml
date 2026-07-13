@@ -1,0 +1,36 @@
+# docker-compose de développement (maquette Diamy Mail).
+# Postgres + observabilité d'abord ; les daemons se lancent avec `cargo run -p ...`
+# le temps que leurs Dockerfiles soient écrits.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: diamymail
+      POSTGRES_USER: diamy
+      POSTGRES_PASSWORD: devonly_change_me   # placeholder de dev — jamais un vrai secret
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes: ["./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: devonly_change_me
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  # --- Daemons (à activer quand leurs Dockerfiles existent) ---
+  # diamy-maild:
+  #   build: { context: ., dockerfile: services/diamy-maild/Dockerfile }
+  #   environment:
+  #     DIAMY_ENV: dev
+  #     DATABASE_URL: postgres://diamy:devonly_change_me@postgres:5432/diamymail
+  #   depends_on: [postgres]
+  #   ports: ["9101:9101"]
+
+volumes:
+  pgdata:
