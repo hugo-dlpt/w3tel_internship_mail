@@ -9,3 +9,4 @@ description = "Logs structurés (sans contenu, INV-21) + métriques Prometheus +
 prometheus.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+rlimit.workspace = true

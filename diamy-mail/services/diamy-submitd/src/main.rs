@@ -10,6 +10,9 @@ use diamy_mail_crypto as crypto;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     diamy_obs::init_tracing();
     let env = std::env::var("DIAMY_ENV").unwrap_or_else(|_| "dev".to_string());
+    // Fail-closed (A18-ZERO-4) : core dumps désactivés en prod AVANT tout traitement de
+    // clair (émission, A04-EP-6) — le dev garde les core dumps.
+    diamy_obs::disable_core_dumps_if_prod(&env)?;
     crypto::assert_backend_allowed_for_env(&env)?;
     tracing::info!(
         service = "diamy-submitd",

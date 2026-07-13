@@ -57,14 +57,48 @@ pub fn assert_backend_allowed_for_env(env: &str) -> Result<(), CryptoError> {
 
 // --- Façade publique : délègue au backend actif ---
 
-/// Chiffre un contenu et renvoie (chiffré, clé de message fraîche).
-pub fn seal_message(plaintext: &[u8]) -> Result<(Ciphertext, MessageKey), CryptoError> {
-    backend::seal_message(plaintext)
+/// Chiffre un contenu et renvoie (chiffré, clé de message fraîche). `aad` est
+/// OBLIGATOIRE (A02-CRY-2/CRY-3) : elle lie ce chiffré à l'emplacement de stockage exact
+/// pour lequel il a été produit, pour qu'un attaquant honest-but-curious avec accès au
+/// stockage ne puisse pas permuter deux chiffrés (ex. `body_ct` d'un message pour le
+/// `summary_ct` d'un autre) sans que le tag GCM le détecte au déchiffrement. Utiliser
+/// [`aad_for_blob`] ou [`aad_for_summary`] pour construire l'AAD normative — jamais une
+/// AAD vide "par défaut" pour ce chemin.
+pub fn seal_message(plaintext: &[u8], aad: &[u8]) -> Result<(Ciphertext, MessageKey), CryptoError> {
+    backend::seal_message(plaintext, aad)
 }
 
-/// Déchiffre et VÉRIFIE le tag ; ne renvoie un `VerifiedPlaintext` qu'en cas de succès (INV-8).
-pub fn open_message(ct: &Ciphertext, key: &MessageKey) -> Result<VerifiedPlaintext, CryptoError> {
-    backend::open_message(ct, key)
+/// Déchiffre et VÉRIFIE le tag ; ne renvoie un `VerifiedPlaintext` qu'en cas de succès
+/// (INV-8). `aad` DOIT être exactement celle passée à `seal_message` au chiffrement,
+/// sans quoi la vérification échoue par construction (fail-closed, INV-16).
+pub fn open_message(
+    ct: &Ciphertext,
+    key: &MessageKey,
+    aad: &[u8],
+) -> Result<VerifiedPlaintext, CryptoError> {
+    backend::open_message(ct, key, aad)
+}
+
+/// AAD normative d'un blob de corps/pièce jointe (A02-CRY-2) : `"mailblob:" + message_id + ":" + blob_id`.
+///
+/// UUIDs en forme BINAIRE (16 octets chacun), jamais la représentation texte à tirets
+/// (CDM-ID-2, common AI error #2 de A02) : une AAD construite à partir de chaînes UUID
+/// rendrait les enveloppes non-interopérables entre Rust et TS.
+pub fn aad_for_blob(message_id: uuid::Uuid, blob_id: uuid::Uuid) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(9 + 16 + 1 + 16);
+    aad.extend_from_slice(b"mailblob:");
+    aad.extend_from_slice(message_id.as_bytes());
+    aad.extend_from_slice(b":");
+    aad.extend_from_slice(blob_id.as_bytes());
+    aad
+}
+
+/// AAD normative du résumé chiffré (A02-CRY-3) : `"mailsum:" + message_id`, UUID binaire.
+pub fn aad_for_summary(message_id: uuid::Uuid) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(8 + 16);
+    aad.extend_from_slice(b"mailsum:");
+    aad.extend_from_slice(message_id.as_bytes());
+    aad
 }
 
 /// Génère une paire de clés de chiffrement d'appareil (ML-KEM-768).
@@ -120,29 +154,45 @@ mod tests {
     #[test]
     fn envelope_round_trip() {
         let plaintext = b"Bonjour Hugo, ceci est un message de test Diamy Mail.";
-        let (ct, mk) = seal_message(plaintext).unwrap();
+        let message_id = uuid::Uuid::now_v7();
+        let blob_id = uuid::Uuid::now_v7();
+        let aad = aad_for_blob(message_id, blob_id);
+        let (ct, mk) = seal_message(plaintext, &aad).unwrap();
 
         let (pk, sk) = generate_device_keypair().unwrap();
         let env = wrap_key_for_device(&mk, &pk).unwrap();
 
         let mk2 = unwrap_key(&env, &sk).unwrap();
-        let opened = open_message(&ct, &mk2).unwrap();
+        let opened = open_message(&ct, &mk2, &aad).unwrap();
         assert_eq!(opened.as_bytes(), plaintext);
     }
 
     // Fail-closed : un tag GCM altéré NE doit PAS produire de clair (INV-8/16).
     #[test]
     fn tampered_ciphertext_is_rejected() {
-        let (mut ct, mk) = seal_message(b"payload").unwrap();
+        let aad = aad_for_summary(uuid::Uuid::now_v7());
+        let (mut ct, mk) = seal_message(b"payload", &aad).unwrap();
         let last = ct.bytes.len() - 1;
         ct.bytes[last] ^= 0x01; // corruption d'un octet
-        assert!(open_message(&ct, &mk).is_err());
+        assert!(open_message(&ct, &mk, &aad).is_err());
+    }
+
+    // AAD obligatoire (A02-CRY-2/3) : un chiffré scellé avec l'AAD d'UN message ne doit
+    // JAMAIS s'ouvrir avec l'AAD d'un AUTRE — sinon un attaquant avec accès au stockage
+    // pourrait permuter deux chiffrés sans que le tag GCM le détecte (le point corrigé
+    // par cet audit).
+    #[test]
+    fn mismatched_aad_is_rejected() {
+        let (message_id_a, message_id_b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let blob_id = uuid::Uuid::now_v7();
+        let (ct, mk) = seal_message(b"payload", &aad_for_blob(message_id_a, blob_id)).unwrap();
+        assert!(open_message(&ct, &mk, &aad_for_blob(message_id_b, blob_id)).is_err());
     }
 
     // Une mauvaise clé d'appareil ne désemballe pas.
     #[test]
     fn wrong_device_cannot_unwrap() {
-        let (_ct, mk) = seal_message(b"payload").unwrap();
+        let (_ct, mk) = seal_message(b"payload", b"test-aad").unwrap();
         let (pk, _sk) = generate_device_keypair().unwrap();
         let (_pk2, sk2) = generate_device_keypair().unwrap();
         let env = wrap_key_for_device(&mk, &pk).unwrap();

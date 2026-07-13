@@ -8,4 +8,11 @@ description = "Client de consommation Diamy IAM (A17). Ne réimplémente JAMAIS 
 [dependencies]
 thiserror.workspace = true
 uuid.workspace = true
+serde.workspace = true
+jsonwebtoken = "9"
 diamy-addr = { path = "../diamy-addr" }
+
+[features]
+# Émetteur de jetons mail-plane de DEV UNIQUEMENT (voir mail_plane_token.rs) — jamais en
+# dehors des tests, un vrai IAM est la SEULE autorité d'émission (A17-P-1).
+dev-token-issuer = []

@@ -9,3 +9,4 @@ description = "Normalisation canonique d'adresse (A24). UNE seule fonction, part
 thiserror.workspace = true
 idna.workspace = true
 unicode-normalization.workspace = true
+base64.workspace = true

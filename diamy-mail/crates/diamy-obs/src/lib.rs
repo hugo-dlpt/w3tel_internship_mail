@@ -53,3 +53,52 @@ pub fn init_tracing() {
     // `try_init` pour ne pas paniquer si déjà initialisé (tests).
     let _ = fmt().with_env_filter(filter).try_init();
 }
+
+/// Désactive les core dumps (`RLIMIT_CORE = 0`) AU DÉMARRAGE, en mode **prod uniquement**
+/// (A18-ZERO-4) : un crash ne doit pas pouvoir déposer un core dump contenant du clair
+/// (message, `k_msg`, jeton...) sur disque (A01-DESTROY-2, A10-EMIT-1). Le dev GARDE les
+/// core dumps (débogage) — `env` vient de `DIAMY_ENV`, comme
+/// `crypto::assert_backend_allowed_for_env`.
+///
+/// **Fail-closed** (A00 SEC-FC, forbidden pattern #12 d'A18 §13) : si la désactivation
+/// échoue en prod — y compris parce que la plateforme n'expose pas `RLIMIT_CORE` — cette
+/// fonction renvoie une erreur ; l'appelant DOIT refuser de démarrer plutôt que de tourner
+/// avec un risque de fuite de clair non maîtrisé au crash.
+pub fn disable_core_dumps_if_prod(env: &str) -> Result<(), String> {
+    if env != "prod" {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        rlimit::setrlimit(rlimit::Resource::CORE, 0, 0)
+            .map_err(|e| format!("désactivation de RLIMIT_CORE impossible en prod (fail-closed) : {e}"))
+    }
+    #[cfg(not(unix))]
+    {
+        Err("RLIMIT_CORE non applicable sur cette plateforme : désactivation des core dumps \
+             non garantie en prod (fail-closed, A18-ZERO-4)"
+            .to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dev_env_leaves_core_dumps_untouched() {
+        // Ne doit RIEN toucher hors prod (le dev garde les core dumps pour déboguer).
+        let before = rlimit::getrlimit(rlimit::Resource::CORE).unwrap();
+        assert!(disable_core_dumps_if_prod("dev").is_ok());
+        let after = rlimit::getrlimit(rlimit::Resource::CORE).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prod_env_actually_sets_rlimit_core_to_zero() {
+        assert!(disable_core_dumps_if_prod("prod").is_ok());
+        let (soft, _hard) = rlimit::getrlimit(rlimit::Resource::CORE).unwrap();
+        assert_eq!(soft, 0, "RLIMIT_CORE (soft) doit être 0 après désactivation en prod");
+    }
+}

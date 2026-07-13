@@ -1,21 +1,93 @@
 //! `diamy-maild` — stockage + sync + annuaire de clés (A02, A04, A17).
 //!
-//! Squelette : au démarrage il applique le garde-fou crypto *fail-closed* (A18 SEC-FC-1)
-//! et expose `/metrics` (Prometheus) sur `:9101`. La sync native (A04) et le stockage
-//! Postgres (A21, via `sqlx`) sont les prochaines étapes.
+//! Démarre en rejouant le chemin vertical de la maquette (comme `diamy-mxd`), via un VRAI
+//! Postgres (A21, sous-ensemble `mail` : folders/messages/blobs/envelopes + `keydir`).
+//! Sert ensuite en parallèle : `/metrics` (Prometheus, `:9101`) et une API de sync (A04)
+//! minimaliste, **en HTTPS** (A04-TR-1, certificat auto-signé de dev), **authentifiée**
+//! (AppKey Tier 2 puis jeton mail-plane, dans cet ordre, A17-APPKEY-5 — voir `auth.rs`),
+//! liée à `127.0.0.1` uniquement (voir `sync_api.rs` et `SIMPLIFICATIONS.md` pour le
+//! périmètre exact et ce qui manque).
 
+mod auth;
+mod sync_api;
+
+use diamy_addr::{diamy_addr_canon, TenantAddressPolicy};
 use diamy_mail_crypto as crypto;
+use diamy_mail_iam::{DevIamClient, IamClient};
+use diamy_mail_storage::{self as storage, BlobStore, InboundMessage};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use uuid::Uuid;
+
+/// Génère un certificat auto-signé de dev pour `hostname` (A04-TR-1). **Jamais une PKI
+/// réelle** — voir `SIMPLIFICATIONS.md` : la force de la crypto TLS est simplifiée, pas la
+/// frontière (la session HTTPS est réellement chiffrée une fois établie).
+async fn generate_dev_tls_config(
+    hostname: &str,
+) -> Result<axum_server::tls_rustls::RustlsConfig, Box<dyn std::error::Error>> {
+    // rustls 0.23 exige un fournisseur crypto explicite ; `install_default` est idempotent
+    // (Err si déjà posé — par un appel précédent ou un autre composant — on l'ignore).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec![hostname.to_string()])?;
+    let cert_pem = cert.pem().into_bytes();
+    let key_pem = key_pair.serialize_pem().into_bytes();
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await?;
+    Ok(config)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     diamy_obs::init_tracing();
 
-    // Fail-closed : refuse de démarrer avec le backend dev hors environnement de dev.
+    // Fail-closed : refuse de démarrer avec le backend dev hors environnement de dev (A18 SEC-FC-1).
     let env = std::env::var("DIAMY_ENV").unwrap_or_else(|_| "dev".to_string());
+    // Fail-closed (A18-ZERO-4) : core dumps désactivés en prod AVANT tout traitement de
+    // clair — le dev garde les core dumps.
+    diamy_obs::disable_core_dumps_if_prod(&env)?;
     crypto::assert_backend_allowed_for_env(&env)?;
+
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://diamy:devonly_change_me@localhost:5433/diamymail".to_string()
+    });
+    let blob_dir =
+        std::env::var("DIAMY_MAILD_BLOB_DIR").unwrap_or_else(|_| "./blob_store".to_string());
+    let pool = storage::connect(&database_url).await?;
+    let blob_store = Arc::new(BlobStore::at(&blob_dir)?);
+
+    run_vertical_slice_demo(&pool, &blob_store, &env).await?;
+
+    // API de sync (A04, tranche lecture seule minimale) — voir sync_api.rs pour le
+    // périmètre exact. HTTPS (A04-TR-1, certificat auto-signé de dev), liée à 127.0.0.1
+    // SEULEMENT (défense en profondeur), ET authentifiée (AppKey Tier 2 puis jeton
+    // mail-plane, A17-APPKEY-5 — voir `auth.rs`).
+    let sync_addr =
+        std::env::var("DIAMY_MAILD_SYNC_ADDR").unwrap_or_else(|_| "127.0.0.1:8443".to_string());
+    let sync_socket_addr: std::net::SocketAddr = sync_addr.parse()?;
+    let tls_config = generate_dev_tls_config("maild.w3.tel").await?;
+    let sync_state = sync_api::SyncState {
+        pool: pool.clone(),
+        blob_store: blob_store.clone(),
+    };
+    let mail_jwt_secret = std::env::var("MAIL_JWT_TOKEN")
+        .unwrap_or_else(|_| "devonly_change_me_mail_jwt_secret".to_string())
+        .into_bytes();
+    let auth_state = auth::AuthState {
+        app_keys: auth::AppKeyStore::seeded_from_env(),
+        mail_jwt_secret,
+    };
+    tracing::info!(addr = %sync_addr, "API de sync (A04, tranche minimale, HTTPS, authentifiée) démarrée");
+    println!("== diamy-maild : API de sync (lecture seule, HTTPS, 127.0.0.1 uniquement, authentifiée) sur {sync_addr} ==");
+    tokio::spawn(async move {
+        if let Err(e) = axum_server::bind_rustls(sync_socket_addr, tls_config)
+            .serve(sync_api::router(sync_state, auth_state).into_make_service())
+            .await
+        {
+            tracing::error!(error = %e, "API de sync arrêtée");
+        }
+    });
 
     let obs = Arc::new(diamy_obs::Obs::new("diamy-maild"));
     let addr = "0.0.0.0:9101";
@@ -27,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         addr,
         "démarré — /metrics exposé"
     );
+    println!("== diamy-maild : /metrics sur {addr} ==");
 
     loop {
         let (mut sock, _peer) = listener.accept().await?;
@@ -46,4 +119,136 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = sock.write_all(resp.as_bytes()).await;
         });
     }
+}
+
+/// Rejoue le chemin vertical (A01→A02→A04→appareil) mais avec un stockage catalogue
+/// Postgres réel + un object store de dev sur disque (voir `storage.rs`).
+async fn run_vertical_slice_demo(
+    pool: &storage::PgPool,
+    blob_store: &BlobStore,
+    env: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("== diamy-maild — démo chemin vertical (Postgres réel) ==");
+    println!("backend crypto : {}", crypto::backend_name());
+    tracing::info!(backend = crypto::backend_name(), env, "démarrage — démo Postgres");
+
+    // 1) Résolution du destinataire via IAM (adresse canonique, A24/A17) — identique à diamy-mxd.
+    let iam = DevIamClient::seeded();
+    let recipient = iam.resolve_principal("hugo@w3.tel")?;
+    let sender = diamy_addr_canon("expediteur.test@example.fr", TenantAddressPolicy::default())?;
+    tracing::info!(recipient_id = %recipient.id, "destinataire résolu via IAM");
+
+    // --- Étape CLIENT (A17-DIR-3) : l'appareil génère SES PROPRES clés, localement, et ne
+    // publie QUE la partie publique. Ni `diamy-maild` ni `diamy-mxd` ne doivent JAMAIS
+    // générer de clé d'appareil eux-mêmes (A17-KEY-2) — voir aussi
+    // `crates/diamy-mail-storage/examples/enroll_test_device.rs`, qui fait exactement ceci
+    // en dehors de tout process serveur.
+    let (identity_pub, identity_sec) = crypto::generate_identity_keypair()?;
+    let (device_pub, device_sec) = crypto::generate_device_keypair()?;
+    let device_id = Uuid::now_v7();
+    // A17-P-3 : dérivation déterministe (UUIDv5 depuis le domaine), même pattern que
+    // DevIamClient::seeded() pour principal_id — voir diamy-mxd et SIMPLIFICATIONS.md.
+    let tenant_id = diamy_mail_iam::derive_dev_tenant_id(recipient.address.domain_alabel());
+    let signature = crypto::sign_manifest(&identity_sec, &device_pub.0)?;
+
+    // --- Étape SERVEUR (A21 §3, A17-DIR-3 étape 3-4) : seule la clé PUBLIQUE + sa
+    // signature entrent dans l'annuaire ; la signature est vérifiée avant acceptation
+    // (A17-KEY-3).
+    storage::publish_device_bundle(
+        pool,
+        recipient.id,
+        device_id,
+        &device_pub.0,
+        &signature.0,
+        device_id,
+        &identity_pub,
+    )
+    .await?;
+    drop(identity_sec); // clé d'identité (stand-in) : jamais persistée, jamais loguée
+
+    let plaintext =
+        b"Bonjour Hugo. Ce message a traverse la frontiere et est stocke dans un vrai Postgres.";
+
+    // A02-CRY-2/3 : `message_id`/`body_blob_id` DOIVENT exister AVANT le chiffrement
+    // pour entrer dans l'AAD (`crypto::aad_for_blob`/`aad_for_summary`) — générés ici,
+    // plutôt qu'à l'intérieur de `store_inbound_message` comme avant ce correctif.
+    let message_id = Uuid::now_v7();
+    let body_blob_id = Uuid::now_v7();
+
+    // 2) Chiffrement (déjà fait à la frontière en réalité ; ici la démo le refait à l'identique).
+    // La clé publique utilisée pour l'enveloppe est relue depuis l'annuaire — PAS la variable
+    // locale `device_pub` — pour prouver que le chemin de lecture réel (A17-DIR-2) fonctionne.
+    let (body_ct, message_key) =
+        crypto::seal_message(plaintext, &crypto::aad_for_blob(message_id, body_blob_id))?;
+    let directory_devices = storage::active_device_keys(pool, recipient.id).await?;
+    let (_, mlkem_pub_from_directory) = directory_devices
+        .into_iter()
+        .find(|(id, _)| *id == device_id)
+        .expect("l'appareil vient d'être publié dans l'annuaire ci-dessus");
+    let device_pub_from_directory = crypto::DeviceEncPublicKey(mlkem_pub_from_directory);
+    let envelope = crypto::wrap_key_for_device(&message_key, &device_pub_from_directory)?;
+    drop(message_key); // clair de la clé détruit dès sortie de scope (INV-1/3)
+
+    // summary_ct (A21-MSG-1) : LE seul contenu dérivé du corps dans `mail.messages`, et
+    // c'est du CIPHERTEXT (A02-CRY-3). On n'a pas encore de vrai extracteur de résumé
+    // (rendu/A08 non fait) : on chiffre un placeholder, documenté en simplification.
+    let (summary_ct, summary_key) =
+        crypto::seal_message(b"[resume non implemente - A08]", &crypto::aad_for_summary(message_id))?;
+    drop(summary_key);
+
+    // 3) Dossier "inbox" du destinataire (créé s'il n'existe pas encore, A21 §2.1).
+    // Placeholder HORS MODÈLE A02 (voir la note équivalente dans diamy-mxd) : AAD
+    // distincte, non-vide, sans prétendre à une conformité A02-CRY-2/3 qui ne s'applique
+    // pas à ce champ.
+    let (folder_name_ct, folder_key) =
+        crypto::seal_message(b"Inbox", b"mailfolder-placeholder:not-a02-modeled")?;
+    drop(folder_key);
+    let inbox_id = storage::ensure_inbox_folder(
+        pool,
+        recipient.id,
+        tenant_id,
+        &folder_name_ct.bytes, // placeholder : la vraie clé de dossier est côté client (A03-KEY-3)
+    )
+    .await?;
+
+    // 4) Stockage RÉEL : ligne `mail.messages` + blob `body` (object store) + `mail.envelopes`.
+    storage::store_inbound_message(
+        pool,
+        blob_store,
+        &InboundMessage {
+            message_id,
+            body_blob_id,
+            principal_id: recipient.id,
+            tenant_id,
+            folder_id: inbox_id,
+            sender_canonical: sender.as_str(),
+            recipient_canonical: recipient.address.as_str(),
+            body_ct: &body_ct,
+            summary_ct: &summary_ct,
+            size_bytes: plaintext.len() as i64,
+            envelopes: &[(device_id, &envelope)],
+            trust_metadata: None, // démo interne, pas une vraie session SMTP (voir diamy-mxd pour le TLS)
+        },
+    )
+    .await?;
+    tracing::info!(message_id = %message_id, "message stocké dans Postgres (chiffré uniquement)");
+
+    // Garde-fou anti-régression : aucune ligne ne contient le clair (INV-1).
+    storage::assert_no_plaintext_leak(pool, blob_store, message_id, plaintext).await?;
+    println!("stockage Postgres + object store : chiffré seulement (aucune fuite de clair) ✔");
+
+    // 5) Sync + client : l'appareil tire le chiffré + SON enveloppe, déchiffre, VÉRIFIE.
+    let fetched =
+        storage::fetch_message_for_device(pool, blob_store, recipient.id, message_id, device_id)
+            .await?;
+    let recovered_key = crypto::unwrap_key(&fetched.envelope, &device_sec)?;
+    let aad = crypto::aad_for_blob(message_id, fetched.body_blob_id);
+    let verified = crypto::open_message(&fetched.body_ct, &recovered_key, &aad)?; // tag vérifié (INV-8)
+
+    assert_eq!(verified.as_bytes(), plaintext);
+    println!("client : lu depuis Postgres, déchiffré + tag vérifié ✔");
+    println!("== chemin vertical (Postgres) OK ==");
+    tracing::info!("chemin vertical (Postgres) terminé avec succès");
+
+    Ok(())
 }

@@ -11,7 +11,7 @@
 //!   - dérivation        : HKDF-SHA256 avec label `info` explicite
 //!   - signature identité : Ed25519 (STAND-IN dev de ML-DSA-65 — À REMPLACER)
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
@@ -33,21 +33,26 @@ const INFO_ENVELOPE: &[u8] = b"diamy-mail/dev-crypto/envelope-kek/v0";
 type Ek = <MlKem768 as KemCore>::EncapsulationKey;
 type Dk = <MlKem768 as KemCore>::DecapsulationKey;
 
-fn aes_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<([u8; 12], Vec<u8>), CryptoError> {
+fn aes_encrypt(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<([u8; 12], Vec<u8>), CryptoError> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce); // nonce indépendant par chiffrement (A18-CRY-3)
     let bytes = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
         .map_err(|_| CryptoError::Encrypt)?;
     Ok((nonce, bytes))
 }
 
-fn aes_decrypt(key: &[u8; 32], nonce: &[u8; 12], bytes: &[u8]) -> Result<Vec<u8>, CryptoError> {
+fn aes_decrypt(key: &[u8; 32], nonce: &[u8; 12], bytes: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    // .decrypt vérifie le tag GCM ; en cas d'échec -> Err (fail-closed, INV-8/16).
+    // .decrypt vérifie le tag GCM (lié à cette AAD précise) ; en cas d'échec -> Err
+    // (fail-closed, INV-8/16) — y compris si l'AAD ne correspond pas à celle du scellement.
     cipher
-        .decrypt(Nonce::from_slice(nonce), bytes)
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: bytes, aad })
         .map_err(|_| CryptoError::DecryptVerify)
 }
 
@@ -58,15 +63,19 @@ fn hkdf32(secret: &[u8], info: &[u8]) -> [u8; 32] {
     okm
 }
 
-pub fn seal_message(plaintext: &[u8]) -> Result<(Ciphertext, MessageKey), CryptoError> {
+pub fn seal_message(plaintext: &[u8], aad: &[u8]) -> Result<(Ciphertext, MessageKey), CryptoError> {
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
-    let (nonce, bytes) = aes_encrypt(&key, plaintext)?;
+    let (nonce, bytes) = aes_encrypt(&key, plaintext, aad)?;
     Ok((Ciphertext { nonce, bytes }, MessageKey::from_bytes(key)))
 }
 
-pub fn open_message(ct: &Ciphertext, key: &MessageKey) -> Result<VerifiedPlaintext, CryptoError> {
-    let pt = aes_decrypt(key.as_bytes(), &ct.nonce, &ct.bytes)?;
+pub fn open_message(
+    ct: &Ciphertext,
+    key: &MessageKey,
+    aad: &[u8],
+) -> Result<VerifiedPlaintext, CryptoError> {
+    let pt = aes_decrypt(key.as_bytes(), &ct.nonce, &ct.bytes, aad)?;
     Ok(VerifiedPlaintext(pt))
 }
 
@@ -89,7 +98,11 @@ pub fn wrap_key_for_device(
     let mut rng = OsRng;
     let (kem_ct, ss) = ek.encapsulate(&mut rng).map_err(|_| CryptoError::Kem)?;
     let kek = hkdf32(ss.as_slice(), INFO_ENVELOPE);
-    let (nonce, bytes) = aes_encrypt(&kek, mk.as_bytes())?;
+    // AAD vide : comportement inchangé par rapport à avant ce correctif. L'AAD normative
+    // de l'enveloppe ("mailenv:"+message_id+":"+device_id, A02-CRY-4) est un gap DISTINCT
+    // de celui traité ici (body_ct/summary_ct sous seal_message) — hors périmètre de ce
+    // correctif ; signalé dans SIMPLIFICATIONS.md, pas comblé par hypothèse.
+    let (nonce, bytes) = aes_encrypt(&kek, mk.as_bytes(), &[])?;
     Ok(Envelope {
         kem_ct: kem_ct.to_vec(),
         wrapped: Ciphertext { nonce, bytes },
@@ -104,7 +117,7 @@ pub fn unwrap_key(env: &Envelope, sk: &DeviceEncSecretKey) -> Result<MessageKey,
         .map_err(|_| CryptoError::InvalidKeyMaterial)?;
     let ss = dk.decapsulate(&ct_arr).map_err(|_| CryptoError::Kem)?;
     let kek = hkdf32(ss.as_slice(), INFO_ENVELOPE);
-    let raw = aes_decrypt(&kek, &env.wrapped.nonce, &env.wrapped.bytes)?;
+    let raw = aes_decrypt(&kek, &env.wrapped.nonce, &env.wrapped.bytes, &[])?; // voir note AAD vide ci-dessus (wrap_key_for_device)
     let arr: [u8; 32] = raw
         .as_slice()
         .try_into()

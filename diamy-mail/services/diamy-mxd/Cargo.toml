@@ -7,8 +7,20 @@ description = "Passerelle entrante + chiffrement frontière (A01). Démo du chem
 
 [dependencies]
 diamy-mail-crypto = { path = "../../crates/diamy-mail-crypto" }
-diamy-mail-model = { path = "../../crates/diamy-mail-model" }
+diamy-mail-storage = { path = "../../crates/diamy-mail-storage" }
 diamy-mail-iam = { path = "../../crates/diamy-mail-iam" }
+diamy-addr = { path = "../../crates/diamy-addr" }
 diamy-obs = { path = "../../crates/diamy-obs" }
+tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
+serde_json.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
+
+[dev-dependencies]
+# Uniquement pour les tests d'intégration (nettoyage ciblé du principal "jamais enrôlé",
+# vérification côté client de la session STARTTLS).
+sqlx.workspace = true

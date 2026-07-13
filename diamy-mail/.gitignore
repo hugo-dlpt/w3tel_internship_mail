@@ -3,3 +3,15 @@
 Cargo.lock.orig
 .env
 .DS_Store
+
+# Stand-in dev de l'object store S3-compatible (A02/A21 §1.1) — Postgres ne stocke que
+# le catalogue ; ceci simule le stockage des blobs chiffrés hors base, en local.
+/services/diamy-maild/blob_store/
+/services/diamy-mxd/blob_store/
+/blob_store/
+
+# Stand-in de dev pour le coffre sécurisé de l'OS (INV-4) — clés privées d'appareils de
+# test générées par `enroll_test_device`. Ne DOIT jamais être commité (ce sont des clés
+# privées, même de test) ni exister en dehors de cette machine de dev.
+/dev_secrets/
+/crates/diamy-mail-storage/dev_secrets/

@@ -18,10 +18,14 @@ fn not_wired<T>() -> Result<T, CryptoError> {
     ))
 }
 
-pub fn seal_message(_plaintext: &[u8]) -> Result<(Ciphertext, MessageKey), CryptoError> {
+pub fn seal_message(_plaintext: &[u8], _aad: &[u8]) -> Result<(Ciphertext, MessageKey), CryptoError> {
     not_wired()
 }
-pub fn open_message(_ct: &Ciphertext, _key: &MessageKey) -> Result<VerifiedPlaintext, CryptoError> {
+pub fn open_message(
+    _ct: &Ciphertext,
+    _key: &MessageKey,
+    _aad: &[u8],
+) -> Result<VerifiedPlaintext, CryptoError> {
     not_wired()
 }
 pub fn generate_device_keypair() -> Result<(DeviceEncPublicKey, DeviceEncSecretKey), CryptoError> {

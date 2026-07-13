@@ -8,19 +8,24 @@ services:
       POSTGRES_DB: diamymail
       POSTGRES_USER: diamy
       POSTGRES_PASSWORD: devonly_change_me   # placeholder de dev — jamais un vrai secret
-    ports: ["5432:5432"]
+    # Port hôte 5433 (pas 5432) : un Postgres natif occupe déjà 127.0.0.1:5432 sur cette
+    # machine (projet STAGE DELEPORTE existant) — on évite toute ambiguïté de port.
+    ports: ["5433:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
 
   prometheus:
     image: prom/prometheus:latest
     volumes: ["./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
-    ports: ["9090:9090"]
+    # Port hôte 9091 (pas 9090) : déjà pris par le stack "diamy-prometheus" du projet
+    # STAGE DELEPORTE (API vocale), qui tourne en parallèle sur cette machine.
+    ports: ["9091:9090"]
 
   grafana:
     image: grafana/grafana:latest
     environment:
       GF_SECURITY_ADMIN_PASSWORD: devonly_change_me
-    ports: ["3000:3000"]
+    # Port hôte 3001 (pas 3000) : même raison que Prometheus ci-dessus ("diamy-grafana").
+    ports: ["3001:3000"]
     depends_on: [prometheus]
 
   # --- Daemons (à activer quand leurs Dockerfiles existent) ---

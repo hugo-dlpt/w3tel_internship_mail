@@ -7,6 +7,25 @@ description = "Stockage + sync + annuaire de clés (A02, A04, A17). Ici : squele
 
 [dependencies]
 diamy-mail-crypto = { path = "../../crates/diamy-mail-crypto" }
+diamy-mail-storage = { path = "../../crates/diamy-mail-storage" }
+diamy-mail-iam = { path = "../../crates/diamy-mail-iam" }
+diamy-addr = { path = "../../crates/diamy-addr" }
 diamy-obs = { path = "../../crates/diamy-obs" }
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+# Uniquement pour les tests d'intégration de l'API de sync (client HTTPS réel) — et pour
+# `mint_dev_mail_plane_token`, qui n'existe QUE derrière ce feature de dev (jamais dans le
+# binaire de prod : le feature n'est activé qu'ici, en dev-dependencies).
+reqwest.workspace = true
+diamy-mail-iam = { path = "../../crates/diamy-mail-iam", features = ["dev-token-issuer"] }

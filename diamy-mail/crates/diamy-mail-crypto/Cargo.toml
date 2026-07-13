@@ -8,6 +8,7 @@ description = "LA seule maison de la crypto Diamy Mail (INV-5). API stable, back
 [dependencies]
 thiserror.workspace = true
 zeroize.workspace = true
+uuid.workspace = true
 
 # --- optionnelles : uniquement pour le backend dev-crypto ---
 aes-gcm = { workspace = true, optional = true }

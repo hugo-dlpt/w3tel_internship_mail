@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/diamy-mail-crypto",
   "crates/diamy-mail-model",
+  "crates/diamy-mail-storage",
   "crates/diamy-mail-iam",
   "crates/diamy-addr",
   "crates/diamy-obs",
@@ -21,11 +22,27 @@ authors = ["W3TEL / TEQTEL"]
 # Communes
 thiserror = "1"
 zeroize = { version = "1", features = ["derive"] }
-uuid = { version = "1", features = ["v7"] }
+rlimit = "0.11"   # RLIMIT_CORE=0 en prod (A18-ZERO-4) — voir diamy-obs::disable_core_dumps_if_prod
+uuid = { version = "1", features = ["v7", "v5", "serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.14"
+
+# Stockage Postgres (A21, catalogue serveur — "cette DDL prévaut" A21 §1)
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "uuid", "time", "migrate", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# API de sync minimaliste (A04) — tranche fine, voir SIMPLIFICATIONS.md pour le périmètre
+axum = "0.7"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# TLS (A01-SMTP-1, A04-TR-1) — certificat auto-signé de dev, jamais une PKI réelle
+rustls = "0.23"
+tokio-rustls = "0.26"
+rcgen = "0.13"
 
 # Backend `dev-crypto` UNIQUEMENT — primitives auditees RustCrypto, JAMAIS en prod.
 # Cible = primitives du messaging Diamy (backend `messaging-crypto`).
@@ -39,3 +56,4 @@ rand = "0.8"
 # Normalisation d'adresse (A24)
 idna = "0.5"
 unicode-normalization = "0.1"
+base64 = "0.22"        # decodage RFC 2047 encoded-words (display-name), vecteur A24 #8
