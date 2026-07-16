@@ -7,6 +7,7 @@ description = "Stockage catalogue Postgres (A21, sous-ensemble) + object store d
 
 [dependencies]
 diamy-mail-crypto = { path = "../diamy-mail-crypto" }
+diamy-obs = { path = "../diamy-obs" }   # sink d'audit distinct (INV-20, A18-LOG-3)
 sqlx.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
@@ -14,13 +15,14 @@ sha2.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-# Uniquement pour les exemples `enroll_test_device`/`read_test_mail` (simulent un
-# CLIENT, jamais le serveur — A03/A04, tranche minimale). `dev-token-issuer` : uniquement
-# pour que `read_test_mail` (un CLIENT de démo, pas `diamy-maild`) puisse présenter un
-# jeton mail-plane à l'API de sync désormais authentifiée (A17-APPKEY-5) — jamais compilé
-# dans le binaire serveur (voir `services/diamy-maild/Cargo.toml`).
-diamy-mail-iam = { path = "../diamy-mail-iam", features = ["dev-token-issuer"] }
+# Uniquement pour les exemples `enroll_test_device`/`read_test_mail` (simulent un CLIENT,
+# jamais le serveur — A03/A04, tranche minimale). `read_test_mail` PRÉSENTE un jeton
+# mail-plane à l'API de sync authentifiée (A17-APPKEY-5) : il le LIT dans la fixture
+# pré-signée (tests/fixtures/dev_mail_plane_tokens.json), il ne le fabrique PAS — aucune
+# fonction d'émission de jeton n'existe plus (INV-9 / A17-P-1).
+diamy-mail-iam = { path = "../diamy-mail-iam" }
 diamy-addr = { path = "../diamy-addr" }
+diamy-mail-render = { path = "../diamy-mail-render" }
 tokio.workspace = true
 base64.workspace = true
 serde.workspace = true

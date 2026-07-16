@@ -93,6 +93,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mail_sec.as_bytes().len(),
         secret_path.display()
     );
+    // A01-HOLD-4 : si `diamy-mxd` tourne, tout message tenu en attente pour ce principal
+    // (zéro appareil actif jusqu'ici) sera relâché par son balayage périodique côté
+    // serveur — PAS déclenché ici : cet exemple simule un CLIENT (voir la doc de module),
+    // et le job de release manipule `k_hold`, un secret SERVEUR que le client ne voit
+    // jamais (violation de zone sinon). Quelques secondes de latence, pas immédiat.
+    println!(
+        "Si diamy-mxd tourne : tout message tenu en attente pour ce principal sera relâché \
+         automatiquement d'ici quelques secondes (balayage périodique côté serveur, A01-HOLD-4)."
+    );
 
     Ok(())
 }

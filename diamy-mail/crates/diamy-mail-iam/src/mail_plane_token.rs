@@ -57,53 +57,72 @@ pub fn verify_mail_plane_token(token: &str, secret: &[u8]) -> Result<Uuid, MailP
         })
 }
 
-/// Doublure de DEV UNIQUEMENT (`dev-token-issuer`, jamais compilée dans un binaire de
-/// prod) : émet un jeton mail-plane pour les tests, en l'absence d'un IAM réel capable
-/// d'en émettre un (A17-TOK-1 : "minted by the IAM backend"). Un vrai IAM reste la SEULE
-/// autorité d'émission (A17-P-1) — ceci ne le remplace pas, ça imite juste sa sortie
-/// pour débloquer les tests d'intégration de `diamy-maild`.
-#[cfg(any(test, feature = "dev-token-issuer"))]
-pub fn mint_dev_mail_plane_token(secret: &[u8], principal_id: Uuid, ttl_secs: i64) -> String {
-    use jsonwebtoken::{encode, EncodingKey, Header};
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("horloge système valide")
-        .as_secs() as i64;
-    let claims = Claims {
-        sub: principal_id,
-        iat: now,
-        exp: now + ttl_secs,
-    };
-    encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
-        .expect("encodage HS256 du jeton de test")
-}
+// NOTE (INV-9 / A17-P-1) : il n'existe DÉLIBÉRÉMENT aucune fonction d'ÉMISSION de jeton
+// mail-plane dans ce module (ni ailleurs dans le repo). « Diamy Mail MUST NOT mint identity
+// or session tokens » — seul IAM est autorité d'émission. Ce module ne fait que VÉRIFIER
+// (`verify_mail_plane_token`, clé de décodage `jsonwebtoken` uniquement, jamais de clé de
+// signature). Les tests et exemples qui ont besoin d'un jeton valide en LISENT un, pré-signé
+// une fois hors du code de production, dans `tests/fixtures/dev_mail_plane_tokens.json` — ils
+// n'en fabriquent jamais. Un test anti-régression (`tests/no_token_minting_in_repo.rs`) échoue
+// si une capacité de signature de jeton réapparaît n'importe où dans le repo.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Jetons de test pré-signés, embarqués À LA COMPILATION (aucune lecture disque ni
+    /// fabrication à l'exécution). Voir l'en-tête du fichier de fixtures pour la discipline.
+    const FIXTURES: &str =
+        include_str!("../../../tests/fixtures/dev_mail_plane_tokens.json");
+
+    fn fixtures() -> serde_json::Value {
+        serde_json::from_str(FIXTURES).expect("fixture de jetons JSON valide")
+    }
+
+    /// Secret HS256 avec lequel les jetons de la fixture ont été signés (source unique).
+    fn fixture_secret() -> Vec<u8> {
+        fixtures()["secret"]
+            .as_str()
+            .expect("champ `secret` présent dans la fixture")
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn fixture_token(name: &str) -> String {
+        fixtures()["tokens"][name]["token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("jeton `{name}` présent dans la fixture"))
+            .to_string()
+    }
+
+    fn fixture_principal(name: &str) -> Uuid {
+        fixtures()["tokens"][name]["principal_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("principal_id de `{name}` présent dans la fixture"))
+            .parse()
+            .expect("principal_id de la fixture est un UUID valide")
+    }
+
     #[test]
     fn round_trip_valid_token() {
-        let secret = b"test-secret-do-not-use-in-prod";
-        let principal_id = Uuid::now_v7();
-        let token = mint_dev_mail_plane_token(secret, principal_id, 900);
-        let resolved = verify_mail_plane_token(&token, secret).unwrap();
-        assert_eq!(resolved, principal_id);
+        // Jeton valide PRÉ-SIGNÉ (jamais fabriqué ici) : la vérification doit réussir et
+        // rendre le `principal_id` (`sub`) figé dans la fixture.
+        let resolved = verify_mail_plane_token(&fixture_token("valid_hugo"), &fixture_secret()).unwrap();
+        assert_eq!(resolved, fixture_principal("valid_hugo"));
     }
 
     #[test]
     fn expired_token_is_rejected() {
-        let secret = b"test-secret-do-not-use-in-prod";
-        let token = mint_dev_mail_plane_token(secret, Uuid::now_v7(), -60);
-        let err = verify_mail_plane_token(&token, secret).unwrap_err();
+        // Jeton PRÉ-SIGNÉ dont l'`exp` est figé dans le passé (2020) : rejet par expiration.
+        let err = verify_mail_plane_token(&fixture_token("expired"), &fixture_secret()).unwrap_err();
         assert!(matches!(err, MailPlaneTokenError::Expired));
     }
 
     #[test]
     fn wrong_secret_is_rejected() {
-        let token = mint_dev_mail_plane_token(b"secret-a", Uuid::now_v7(), 900);
-        let err = verify_mail_plane_token(&token, b"secret-b").unwrap_err();
+        // Même jeton valide, mais vérifié avec un AUTRE secret : la signature ne colle plus.
+        let err = verify_mail_plane_token(&fixture_token("valid_hugo"), b"un-autre-secret-de-dev")
+            .unwrap_err();
         assert!(matches!(err, MailPlaneTokenError::Invalid));
     }
 

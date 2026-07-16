@@ -12,7 +12,9 @@ serde.workspace = true
 jsonwebtoken = "9"
 diamy-addr = { path = "../diamy-addr" }
 
-[features]
-# Émetteur de jetons mail-plane de DEV UNIQUEMENT (voir mail_plane_token.rs) — jamais en
-# dehors des tests, un vrai IAM est la SEULE autorité d'émission (A17-P-1).
-dev-token-issuer = []
+[dev-dependencies]
+# Lecture des jetons mail-plane PRÉ-SIGNÉS (tests/fixtures/dev_mail_plane_tokens.json) par les
+# tests unitaires : ceux-ci VÉRIFIENT ces jetons, ils n'en fabriquent aucun. Aucune fonction
+# d'émission de jeton n'existe dans ce crate (INV-9 / A17-P-1 : seul IAM émet des jetons) —
+# d'où l'absence de tout feature "issuer" ; la capacité de signer un jeton a été RETIRÉE.
+serde_json.workspace = true

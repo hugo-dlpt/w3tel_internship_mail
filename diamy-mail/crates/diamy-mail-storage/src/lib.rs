@@ -15,9 +15,15 @@
 //! sa partie privée ne quitte jamais l'appareil). Voir `examples/enroll_test_device.rs`
 //! pour la simulation, hors serveur, d'un appareil qui s'enrôle et publie sa clé publique.
 //!
-//! Portée volontairement minimale (tranche verticale, guide §7) : `journal`, `hold_queue`,
-//! `search`, `send`, `onboard`, `cal`, `iam` restent hors périmètre (voir
-//! `SIMPLIFICATIONS.md`).
+//! Portée volontairement minimale (tranche verticale, guide §7) : `journal`, `search`,
+//! `send`, `onboard`, `cal`, `iam` restent hors périmètre (voir `SIMPLIFICATIONS.md`).
+//! `hold_queue` (A01-HOLD, ferme A17-DIR-5) EST implémentée selon le design **clé seule**
+//! d'A01-HOLD-1/5 (A21 §2.6 v1.5, arbitré par Cédric le 2026-07-15) : un message tenu est
+//! catalogué normalement (`store_held_message` : ligne `messages` + blob `body` sous
+//! `k_msg`, SANS enveloppe d'appareil), et `hold_queue` ne porte que `k_msg` emballé sous
+//! `k_hold`. La release (`release_held_messages_for_principal`) ne désemballe que `k_msg`
+//! et produit des enveloppes normales — le corps chiffré n'est JAMAIS re-manipulé
+//! (A01-HOLD-5). Voir aussi `list_held_for_principal`/`delete_hold`/`purge_expired_holds`.
 //!
 //! Discipline appliquée (A18 §13 forbidden patterns) :
 //! - toutes les requêtes sont paramétrées (`$1, $2, ...`), jamais de SQL concaténé (A18-DB-1) ;
@@ -26,7 +32,9 @@
 //! - `body_ciphertext`/`kem_ct`/`wrapped_key` ne sont JAMAIS logués (A18-LOG-1).
 #![forbid(unsafe_code)]
 
-use diamy_mail_crypto::{Ciphertext, Envelope, IdentityPublicKey, Signature};
+use diamy_mail_crypto::{
+    AlgVersion, Ciphertext, DeviceEncPublicKey, Envelope, IdentityPublicKey, Signature,
+};
 use sqlx::postgres::PgPoolOptions;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -157,25 +165,23 @@ pub struct InboundMessage<'a> {
     pub trust_metadata: Option<serde_json::Value>,
 }
 
-/// Stocke un message entrant : ligne `messages` + blob `body` (objet local) + enveloppes.
-/// Transactionnel : soit tout est écrit, soit rien (A18-ERR : pas d'état partiel visible).
-pub async fn store_inbound_message(
-    pool: &PgPool,
+/// Insère la ligne `messages` + le blob `body` (objet local) DANS une transaction déjà
+/// ouverte. Partagé par [`store_inbound_message`] (livraison normale, avec enveloppes) et
+/// [`store_held_message`] (mise en hold, SANS enveloppe, A01-HOLD-1) : une seule
+/// implémentation du catalogage, jamais deux copies qui pourraient diverger.
+async fn insert_message_and_body(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     blob_store: &BlobStore,
     msg: &InboundMessage<'_>,
-) -> Result<Uuid, StorageError> {
-    let message_id = msg.message_id;
-
-    let mut tx = pool.begin().await?;
-
+) -> Result<(), StorageError> {
     sqlx::query(
         "INSERT INTO mail.messages
             (message_id, principal_id, tenant_id, direction, folder_id,
              sender_canonical, recipients_canonical, received_at, size_bytes,
-             summary_ct, summary_nonce, trust_metadata)
-         VALUES ($1, $2, $3, 'inbound', $4, $5, $6, now(), $7, $8, $9, $10)",
+             summary_ct, summary_nonce, trust_metadata, blob_alg_version)
+         VALUES ($1, $2, $3, 'inbound', $4, $5, $6, now(), $7, $8, $9, $10, $11)",
     )
-    .bind(message_id)
+    .bind(msg.message_id)
     .bind(msg.principal_id)
     .bind(msg.tenant_id)
     .bind(msg.folder_id)
@@ -185,47 +191,81 @@ pub async fn store_inbound_message(
     .bind(&msg.summary_ct.bytes)
     .bind(msg.summary_ct.nonce.as_slice())
     .bind(&msg.trust_metadata)
-    .execute(&mut *tx)
+    // A02-CRY-7 : version de suite du summary_ct écrite EXPLICITEMENT au scellement (INV-7),
+    // plus jamais laissée au DEFAULT implicite de la DDL.
+    .bind(msg.summary_ct.alg_version.as_i32())
+    .execute(&mut **tx)
     .await?;
 
     // Le corps chiffré part dans l'object store (A21 §1.1), PAS dans une colonne BYTEA
     // de `mail.messages` — Postgres ne garde que la référence `object_key` + son digest.
-    let blob_id = msg.body_blob_id;
-    let object_key = format!("blobs/{blob_id}");
+    let object_key = format!("blobs/{}", msg.body_blob_id);
     blob_store.write(&object_key, &msg.body_ct.bytes)?;
     let sha512_ct = sha512_of(&msg.body_ct.bytes);
 
     sqlx::query(
         "INSERT INTO mail.blobs
-            (blob_id, message_id, kind, object_key, nonce, size_bytes, sha512_ct)
-         VALUES ($1, $2, 'body', $3, $4, $5, $6)",
+            (blob_id, message_id, kind, object_key, nonce, size_bytes, sha512_ct, blob_alg_version)
+         VALUES ($1, $2, 'body', $3, $4, $5, $6, $7)",
     )
-    .bind(blob_id)
-    .bind(message_id)
+    .bind(msg.body_blob_id)
+    .bind(msg.message_id)
     .bind(&object_key)
     .bind(msg.body_ct.nonce.as_slice())
     .bind(msg.size_bytes)
     .bind(sha512_ct.as_slice()) // digest du CHIFFRÉ, jamais du clair (A21-BLOB-1 / A21-X-3)
-    .execute(&mut *tx)
+    .bind(msg.body_ct.alg_version.as_i32()) // A02-CRY-7 : version écrite au scellement (INV-7)
+    .execute(&mut **tx)
     .await?;
+    Ok(())
+}
 
-    for (device_id, envelope) in msg.envelopes {
+/// Insère les enveloppes (clé de message emballée PAR appareil, A02-DM-3) d'un message dans
+/// une transaction ouverte. `UPSERT` sur la PK `(message_id, device_id)` (A21-ENV-1) : une
+/// ré-exécution ne duplique pas (idempotence exigée A01-HOLD-4 / A02-RW-2).
+async fn insert_envelopes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    message_id: Uuid,
+    envelopes: &[(Uuid, &Envelope)],
+    origin: &str,
+) -> Result<(), StorageError> {
+    for (device_id, envelope) in envelopes {
         sqlx::query(
             "INSERT INTO mail.envelopes
-                (message_id, device_id, kem_ct, wrapped_key, wrap_nonce, origin)
-             VALUES ($1, $2, $3, $4, $5, 'frontier')",
+                (message_id, device_id, kem_ct, wrapped_key, wrap_nonce, alg_version, origin)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (message_id, device_id) DO UPDATE
+                SET kem_ct = EXCLUDED.kem_ct,
+                    wrapped_key = EXCLUDED.wrapped_key,
+                    wrap_nonce = EXCLUDED.wrap_nonce,
+                    alg_version = EXCLUDED.alg_version,
+                    origin = EXCLUDED.origin",
         )
         .bind(message_id)
         .bind(device_id)
         .bind(&envelope.kem_ct)
         .bind(&envelope.wrapped.bytes)
         .bind(envelope.wrapped.nonce.as_slice())
-        .execute(&mut *tx)
+        .bind(envelope.wrapped.alg_version.as_i32()) // A02-CRY-7 : version écrite au scellement (INV-7)
+        .bind(origin)
+        .execute(&mut **tx)
         .await?;
     }
+    Ok(())
+}
 
+/// Stocke un message entrant : ligne `messages` + blob `body` (objet local) + enveloppes.
+/// Transactionnel : soit tout est écrit, soit rien (A18-ERR : pas d'état partiel visible).
+pub async fn store_inbound_message(
+    pool: &PgPool,
+    blob_store: &BlobStore,
+    msg: &InboundMessage<'_>,
+) -> Result<Uuid, StorageError> {
+    let mut tx = pool.begin().await?;
+    insert_message_and_body(&mut tx, blob_store, msg).await?;
+    insert_envelopes(&mut tx, msg.message_id, msg.envelopes, "frontier").await?;
     tx.commit().await?;
-    Ok(message_id)
+    Ok(msg.message_id)
 }
 
 /// Ce que l'appareil récupère pour UN message + SON enveloppe (A02 §3, "le client tire").
@@ -253,8 +293,8 @@ pub async fn fetch_message_for_device(
     message_id: Uuid,
     device_id: Uuid,
 ) -> Result<FetchedForDevice, StorageError> {
-    let blob_row = sqlx::query_as::<_, (Uuid, String, Vec<u8>)>(
-        "SELECT b.blob_id, b.object_key, b.nonce
+    let blob_row = sqlx::query_as::<_, (Uuid, String, Vec<u8>, i32)>(
+        "SELECT b.blob_id, b.object_key, b.nonce, b.blob_alg_version
          FROM mail.blobs b
          JOIN mail.messages m ON m.message_id = b.message_id
          WHERE b.message_id = $1 AND b.kind = 'body' AND m.principal_id = $2
@@ -266,15 +306,19 @@ pub async fn fetch_message_for_device(
     .await?
     .ok_or(StorageError::MessageNotFound(message_id))?;
 
-    let (body_blob_id, object_key, nonce) = blob_row;
+    let (body_blob_id, object_key, nonce, body_alg_version) = blob_row;
     let body_bytes = blob_store.read(&object_key)?;
     let body_ct = Ciphertext {
+        // INV-7 / A02-CRY-7 : la version lue en base est contrôlée ICI (fail-closed sur
+        // inconnue, INV-16) avant même que le chiffré ne parte au client — l'`open_message`
+        // client la re-dispatchera aussi (défense en profondeur).
+        alg_version: AlgVersion::from_i32(body_alg_version)?,
         nonce: nonce_from_vec(&nonce)?,
         bytes: body_bytes,
     };
 
-    let env_row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Vec<u8>)>(
-        "SELECT e.kem_ct, e.wrapped_key, e.wrap_nonce
+    let env_row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Vec<u8>, i32)>(
+        "SELECT e.kem_ct, e.wrapped_key, e.wrap_nonce, e.alg_version
          FROM mail.envelopes e
          JOIN mail.messages m ON m.message_id = e.message_id
          WHERE e.message_id = $1 AND e.device_id = $2 AND m.principal_id = $3",
@@ -286,10 +330,11 @@ pub async fn fetch_message_for_device(
     .await?
     .ok_or(StorageError::EnvelopeNotFound)?;
 
-    let (kem_ct, wrapped_key, wrap_nonce) = env_row;
+    let (kem_ct, wrapped_key, wrap_nonce, env_alg_version) = env_row;
     let envelope = Envelope {
         kem_ct,
         wrapped: Ciphertext {
+            alg_version: AlgVersion::from_i32(env_alg_version)?, // INV-7, fail-closed
             nonce: nonce_from_vec(&wrap_nonce)?,
             bytes: wrapped_key,
         },
@@ -413,6 +458,17 @@ pub async fn publish_device_bundle(
         return Err(StorageError::InvalidDeviceBundleSignature);
     }
 
+    // INV-20 / A18-LOG-3 : état AVANT la publication (pour l'entrée d'audit before/after).
+    // Empreinte de la clé PUBLIQUE seulement, jamais la clé brute (INV-21).
+    let before = sqlx::query_as::<_, (Vec<u8>, String)>(
+        "SELECT mlkem_pub, validity_state FROM keydir.mail_device_keys
+         WHERE principal_id = $1 AND device_id = $2",
+    )
+    .bind(principal_id)
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await?;
+
     sqlx::query(
         "INSERT INTO keydir.mail_device_keys
             (principal_id, device_id, mlkem_pub, dilithium_sig, signing_device, validity_state)
@@ -430,14 +486,48 @@ pub async fn publish_device_bundle(
     .bind(signing_device)
     .execute(pool)
     .await?;
+
+    // INV-20 : publication d'annuaire de clés = action privilégiée -> sink d'audit distinct
+    // (actor = appareil signataire ; before/after = état + empreinte de clé publique).
+    let before_json = match &before {
+        Some((prev_pub, prev_state)) => serde_json::json!({
+            "existed": true,
+            "prev_validity_state": prev_state,
+            "prev_mlkem_pub_fp": key_fingerprint(prev_pub),
+        }),
+        None => serde_json::json!({ "existed": false }),
+    };
+    diamy_obs::audit::record(
+        &format!("device:{signing_device}"),
+        "keydir.publish_device_bundle",
+        before_json,
+        serde_json::json!({
+            "principal_id": principal_id,
+            "device_id": device_id,
+            "signing_device": signing_device,
+            "validity_state": "active",
+            "mlkem_pub_fp": key_fingerprint(mlkem_pub),
+        }),
+    );
     Ok(())
+}
+
+/// Empreinte courte (8 premiers octets du SHA-512, en hex) d'une clé PUBLIQUE, pour les
+/// entrées d'audit (INV-20) : identifie la clé sans en journaliser les octets bruts (INV-21).
+fn key_fingerprint(public_key_bytes: &[u8]) -> String {
+    sha512_of(public_key_bytes)
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Lit les clés publiques des appareils ACTIFS d'un principal (A17-DIR-2 : la frontière
 /// lit cet annuaire au moment du chiffrement — elle ne génère jamais de clé elle-même).
 /// Une liste vide signifie "zéro appareil actif" (A17-DIR-5) : l'appelant DOIT alors
-/// passer par la file de hold (A01-HOLD, non implémentée dans cette maquette — voir
-/// `SIMPLIFICATIONS.md`), jamais fabriquer une clé de substitution.
+/// passer par la file de hold (A01-HOLD, IMPLÉMENTÉE — voir `store_held_message`/
+/// `release_held_messages_for_principal` plus bas et `SIMPLIFICATIONS.md`), jamais
+/// fabriquer une clé de substitution.
 pub async fn active_device_keys(
     pool: &PgPool,
     principal_id: Uuid,
@@ -450,4 +540,312 @@ pub async fn active_device_keys(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// Borne de taille de la file de hold PAR PRINCIPAL (A01-HOLD-3 : "size-bounded per
+/// principal; overflow tempfails new inbound"). Valeur de maquette, pas configurable par
+/// tenant (A01-HOLD-3 le demande ; voir `SIMPLIFICATIONS.md`).
+pub const MAX_HELD_PER_PRINCIPAL: i64 = 100;
+
+/// Un message tenu en attente (A01-HOLD-1), design **clé seule** (A21 §2.6 v1.5) : le
+/// message est déjà catalogué (`message_id`, blob de corps sous `k_msg` dans `mail.blobs`),
+/// et `wrapped_kmsg` ne porte que `k_msg` emballé sous `k_hold` — JAMAIS le corps.
+pub struct HeldMessage {
+    pub hold_id: Uuid,
+    pub tenant_id: Uuid,
+    /// Le message déjà catalogué dans `mail.messages` auquel ce hold se rapporte (A01-HOLD-1).
+    pub message_id: Uuid,
+    /// `k_msg` emballé sous `k_hold` (A01-HOLD-1) — à désemballer via
+    /// [`diamy_mail_crypto::unwrap_message_key_from_hold`], jamais `open_with_key` (ce
+    /// n'est pas un corps).
+    pub wrapped_kmsg: Ciphertext,
+}
+
+/// A01-HOLD-1 (design clé seule) : catalogue le message COMME une livraison ordinaire
+/// (ligne `messages` + blob `body` sous `k_msg`) mais SANS enveloppe d'appareil (aucun
+/// appareil actif), puis dépose en file `k_msg` emballé sous `k_hold` (`wrapped_kmsg`).
+/// Tout en UNE transaction (A18-ERR : pas d'état partiel — jamais de message catalogué
+/// sans sa ligne de hold, ni l'inverse). `wrapped_kmsg` DOIT être produit par l'appelant
+/// via `crypto::wrap_message_key_under_hold` (+ `crypto::aad_for_hold(hold_id)`).
+/// Expiration +30 jours calculée en SQL (A01-HOLD-3), pas d'horloge applicative.
+#[allow(clippy::too_many_arguments)]
+pub async fn store_held_message(
+    pool: &PgPool,
+    blob_store: &BlobStore,
+    msg: &InboundMessage<'_>,
+    hold_id: Uuid,
+    wrapped_kmsg: &Ciphertext,
+) -> Result<(), StorageError> {
+    debug_assert!(
+        msg.envelopes.is_empty(),
+        "un message tenu n'a AUCUNE enveloppe d'appareil (A01-HOLD-1) — sinon il serait déjà livrable"
+    );
+    let mut tx = pool.begin().await?;
+    insert_message_and_body(&mut tx, blob_store, msg).await?;
+    sqlx::query(
+        "INSERT INTO mail.hold_queue
+            (hold_id, principal_id, tenant_id, message_id, wrapped_kmsg, wrap_nonce, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, now() + interval '30 days')",
+    )
+    .bind(hold_id)
+    .bind(msg.principal_id)
+    .bind(msg.tenant_id)
+    .bind(msg.message_id)
+    .bind(&wrapped_kmsg.bytes)
+    .bind(wrapped_kmsg.nonce.as_slice())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// A01-HOLD-3 : compte les messages actuellement tenus pour CE principal, pour appliquer
+/// la borne de taille avant d'accepter un nouveau message dans la file.
+pub async fn count_held_for_principal(pool: &PgPool, principal_id: Uuid) -> Result<i64, StorageError> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mail.hold_queue WHERE principal_id = $1")
+        .bind(principal_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+/// A01-HOLD-4 : les principaux ayant AU MOINS un message tenu — c'est la liste que le job
+/// de release (périodique, `diamy-mxd`) parcourt à chaque passage pour savoir qui essayer
+/// de relâcher (la fonction de release elle-même est un no-op si toujours zéro appareil).
+pub async fn distinct_held_principal_ids(pool: &PgPool) -> Result<Vec<Uuid>, StorageError> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as("SELECT DISTINCT principal_id FROM mail.hold_queue")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Profondeur totale de la file de hold, tous principaux confondus (A01 §11 :
+/// "gauges: hold-queue depth per tenant" — ici simplifié à une profondeur globale, pas
+/// encore par tenant, voir SIMPLIFICATIONS.md). Alimente une jauge Prometheus, pas un
+/// compteur : peut monter ET descendre.
+pub async fn total_held_count(pool: &PgPool) -> Result<i64, StorageError> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mail.hold_queue")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+/// A01-HOLD-4 : tous les messages tenus pour ce principal — appelé par le job de release
+/// une fois le premier appareil publié.
+pub async fn list_held_for_principal(
+    pool: &PgPool,
+    principal_id: Uuid,
+) -> Result<Vec<HeldMessage>, StorageError> {
+    // Tuple de projection SQL (hold_id, tenant_id, message_id, wrapped_kmsg, wrap_nonce) —
+    // reconstruit immédiatement en `HeldMessage` juste en dessous.
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(Uuid, Uuid, Uuid, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT hold_id, tenant_id, message_id, wrapped_kmsg, wrap_nonce
+         FROM mail.hold_queue WHERE principal_id = $1",
+    )
+    .bind(principal_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|(hold_id, tenant_id, message_id, bytes, nonce)| {
+            Ok(HeldMessage {
+                hold_id,
+                tenant_id,
+                message_id,
+                wrapped_kmsg: Ciphertext {
+                    // `hold_queue` n'a pas de colonne de version (A21 §2.6) : donnée
+                    // transitoire, emballée ET désemballée côté serveur dans la même version
+                    // de code. On reconstruit avec `CURRENT` (jamais une version inconnue
+                    // devinée). Contrairement à la note d'avant l'amendement A21 v1.5, ce
+                    // n'est plus rattaché à une divergence ouverte — le design clé-seule est
+                    // tranché (voir 0004_hold_queue_key_only.sql).
+                    alg_version: AlgVersion::CURRENT,
+                    nonce: nonce_from_vec(&nonce)?,
+                    bytes,
+                },
+            })
+        })
+        .collect()
+}
+
+/// A01-HOLD-4 : détruit la copie tenue après release réussie (idempotent : un second
+/// appel sur un `hold_id` déjà supprimé ne renvoie pas d'erreur, `DELETE` ne fait rien).
+pub async fn delete_hold(pool: &PgPool, hold_id: Uuid) -> Result<(), StorageError> {
+    sqlx::query("DELETE FROM mail.hold_queue WHERE hold_id = $1")
+        .bind(hold_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A01-HOLD-3 : purge les messages tenus expirés. Renvoie les `(hold_id, principal_id)`
+/// purgés — pour un vrai DSN à l'expéditeur d'origine (A01-HOLD-3), NON implémenté ici
+/// (aucun envoi sortant DSN n'existe dans cette maquette, voir `SIMPLIFICATIONS.md) : la
+/// purge a lieu, mais sans notification réelle à l'expéditeur.
+pub async fn purge_expired_holds(pool: &PgPool) -> Result<Vec<(Uuid, Uuid)>, StorageError> {
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "DELETE FROM mail.hold_queue WHERE expires_at < now() RETURNING hold_id, principal_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    // INV-20 / A18-LOG-3 : la purge est une destruction irréversible -> entrée d'audit
+    // distincte (une par lot non vide). Actor = le job de balayage serveur.
+    if !rows.is_empty() {
+        diamy_obs::audit::record(
+            "diamy-mxd:hold-sweep",
+            "hold.purge_expired",
+            serde_json::json!({ "purged_count": rows.len() }),
+            serde_json::json!({
+                "hold_ids": rows.iter().map(|(h, _)| h.to_string()).collect::<Vec<_>>(),
+                "principal_ids": rows.iter().map(|(_, p)| p.to_string()).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    Ok(rows)
+}
+
+/// A01-HOLD-4/5 (release) : "upon publication of the recipient's first device bundle...
+/// re-derive k_hold, **unwrap `k_msg`** in the frontier trust boundary, produce normal
+/// per-device envelopes (A02-CRY-4), persist them, and destroy the hold-queue copy". Vit
+/// ICI (pas dans `diamy-mxd`) pour qu'il n'existe qu'UNE implémentation, appelable à la
+/// fois par l'exemple d'enrôlement et par les tests d'intégration de `diamy-mxd`.
+///
+/// Design **clé seule** (A21 §2.6 v1.5, arbitré par Cédric le 2026-07-15) : le message est
+/// DÉJÀ catalogué (ligne `mail.messages` + blob de corps sous `k_msg`, écrits à la
+/// réception par `store_held_message`). Cette fonction ne fait donc que :
+///   1. désemballer `k_msg` depuis `k_hold` (`unwrap_message_key_from_hold` — la clé, JAMAIS
+///      le corps) ;
+///   2. produire des enveloppes normales de `k_msg` pour les appareils désormais actifs,
+///      liées au `message_id` PRÉ-EXISTANT ;
+///   3. supprimer la ligne de hold.
+///
+/// Le corps chiffré (`mail.blobs`) n'est ni lu, ni réécrit, ni re-scellé — bit-à-bit
+/// inchangé (A01-HOLD-5, A01 §13 err.#8 : ne PAS reconstruire le clair du corps). Elle
+/// n'appelle donc AUCUNE fonction de déchiffrement du corps (`open_message`/`open_with_key`)
+/// — vérifié par un test dédié (voir `tests`). `sender_canonical` et tout le catalogue sont
+/// préservés (ce sont les colonnes de la ligne `mail.messages`, posées à la réception) :
+/// plus de placeholder « expéditeur perdu ». Ni `blob_store` ni `recipient_canonical` ne
+/// sont nécessaires (rien du corps ni de l'adresse n'est re-manipulé ici).
+pub async fn release_held_messages_for_principal(
+    pool: &PgPool,
+    hold_master_secret: &[u8],
+    principal_id: Uuid,
+) -> Result<usize, StorageError> {
+    let devices = active_device_keys(pool, principal_id).await?;
+    if devices.is_empty() {
+        return Ok(0); // A01-HOLD-4 : rien à relâcher tant qu'aucun appareil n'est actif
+    }
+
+    let held = list_held_for_principal(pool, principal_id).await?;
+    let mut released = 0usize;
+
+    for item in held {
+        let k_hold = diamy_mail_crypto::derive_k_hold(hold_master_secret, item.tenant_id, principal_id)?;
+        let aad = diamy_mail_crypto::aad_for_hold(item.hold_id);
+        // A01-HOLD-4/5 : on désemballe UNIQUEMENT k_msg (la clé), jamais le corps.
+        // Fail-closed (INV-8/16) : un tag GCM invalide laisse la copie EN FILE plutôt que de
+        // perdre un message qu'on n'a pas pu ouvrir.
+        let Ok(message_key) =
+            diamy_mail_crypto::unwrap_message_key_from_hold(&item.wrapped_kmsg, &k_hold, &aad)
+        else {
+            continue;
+        };
+
+        // Enveloppes normales (A02-CRY-4) pour le message DÉJÀ catalogué : le corps chiffré
+        // dans `mail.blobs` n'est jamais touché (A01-HOLD-5).
+        let mut envelopes = Vec::with_capacity(devices.len());
+        for (device_id, mlkem_pub_bytes) in &devices {
+            let device_pub = DeviceEncPublicKey(mlkem_pub_bytes.clone());
+            let envelope = diamy_mail_crypto::wrap_key_for_device(
+                &message_key,
+                &device_pub,
+                &diamy_mail_crypto::aad_for_envelope(item.message_id, *device_id),
+            )?;
+            envelopes.push((*device_id, envelope));
+        }
+        drop(message_key); // INV-1/3 : la clé de message ne survit pas au-delà de l'usage
+        let envelope_refs: Vec<(Uuid, &Envelope)> = envelopes.iter().map(|(id, e)| (*id, e)).collect();
+
+        // Enveloppes + marquage `released_from_hold` + suppression du hold : UNE transaction
+        // atomique. Idempotente/resumable (A01-HOLD-4) : `insert_envelopes` est un UPSERT sur
+        // la PK `(message_id, device_id)`, et si la fonction est relancée la ligne de hold
+        // aura disparu (ou sera re-traitée sans duplication).
+        let mut tx = pool.begin().await?;
+        insert_envelopes(&mut tx, item.message_id, &envelope_refs, "frontier").await?;
+        sqlx::query(
+            "UPDATE mail.messages
+             SET trust_metadata = COALESCE(trust_metadata, '{}'::jsonb) || '{\"released_from_hold\": true}'::jsonb
+             WHERE message_id = $1",
+        )
+        .bind(item.message_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM mail.hold_queue WHERE hold_id = $1")
+            .bind(item.hold_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        // INV-20 / A18-LOG-3 : la libération de hold est une action privilégiée -> sink
+        // d'audit distinct (une entrée par message relâché), comme `publish_device_bundle`
+        // et `purge_expired_holds`. Jamais de clé ni de contenu (INV-21) : IDs + compte
+        // d'enveloppes seulement.
+        diamy_obs::audit::record(
+            "diamy-mxd:hold-release",
+            "hold.release",
+            serde_json::json!({ "hold_id": item.hold_id, "message_id": item.message_id }),
+            serde_json::json!({
+                "message_id": item.message_id,
+                "principal_id": principal_id,
+                "envelopes_created": envelope_refs.len(),
+            }),
+        );
+        released += 1;
+    }
+
+    Ok(released)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A01-HOLD-5 / A01 §13 err.#8 (PREUVE par analyse statique du call-graph) : la release
+    /// de hold ne doit JAMAIS appeler une fonction de déchiffrement du CORPS
+    /// (`open_message`/`open_with_key`). Elle ne fait transiter que la clé
+    /// (`unwrap_message_key_from_hold`), design clé-seule A01-HOLD-1/5 (mirroir de A02-RW-1).
+    ///
+    /// On lit le source de CETTE crate et on isole le CORPS de
+    /// `release_held_messages_for_principal` (de sa signature jusqu'au module de tests) —
+    /// les mentions de `open_message`/`open_with_key` dans les commentaires de doc (AVANT la
+    /// signature) sont donc hors périmètre. Un test qui échoue à la compilation si la
+    /// fonction réintroduit un déchiffrement de corps : régression impossible en silence.
+    #[test]
+    fn release_never_decrypts_the_body() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("pub async fn release_held_messages_for_principal")
+            .expect("la fonction de release doit exister");
+        // Fin = début du module de tests (release est le dernier item non-test du fichier).
+        let end = src[start..]
+            .find("\n#[cfg(test)]")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+
+        assert!(
+            !body.contains("open_with_key"),
+            "release_held_messages_for_principal NE doit PAS appeler open_with_key (A01-HOLD-5)"
+        );
+        assert!(
+            !body.contains("open_message"),
+            "release_held_messages_for_principal NE doit PAS appeler open_message (A01-HOLD-5)"
+        );
+        // Contrôle positif : elle DOIT bien désemballer la clé seule (sinon le test ci-dessus
+        // passerait trivialement si la fonction était vidée/renommée).
+        assert!(
+            body.contains("unwrap_message_key_from_hold"),
+            "release doit désemballer k_msg via unwrap_message_key_from_hold (A01-HOLD-4)"
+        );
+    }
 }

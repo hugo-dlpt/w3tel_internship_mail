@@ -14,9 +14,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod mail_plane_token;
+// Seule la VÉRIFICATION est exposée. Aucune fonction d'émission de jeton n'existe (INV-9 /
+// A17-P-1 : seul IAM émet des jetons) — voir la note dans `mail_plane_token.rs`.
 pub use mail_plane_token::{verify_mail_plane_token, MailPlaneTokenError};
-#[cfg(any(test, feature = "dev-token-issuer"))]
-pub use mail_plane_token::mint_dev_mail_plane_token;
 
 #[derive(Debug, Error)]
 pub enum IamError {
@@ -86,6 +86,15 @@ impl DevIamClient {
             );
         }
         Self { principals }
+    }
+
+    /// Résolution INVERSE (id -> principal) : un vrai IAM la supporte trivialement ; cette
+    /// doublure de dev l'ajoute pour que `diamy-mxd` puisse retrouver l'adresse d'un
+    /// principal qui a de la file de hold en attente (A01-HOLD-4, le job de release ne
+    /// connait que des `principal_id`, jamais des adresses) sans avoir à stocker
+    /// l'adresse une seconde fois côté stockage (voir SIMPLIFICATIONS.md).
+    pub fn find_by_id(&self, id: Uuid) -> Option<&Principal> {
+        self.principals.values().find(|p| p.id == id)
     }
 }
 

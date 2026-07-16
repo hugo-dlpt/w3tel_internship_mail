@@ -1,7 +1,7 @@
 # Diamy Mail — ANNEX A21: Storage Schema DDL
 
 **Document title:** Diamy Mail — ANNEX A21: Storage Schema (Physical DDL)
-**Version:** 1.4
+**Version:** 1.5
 **Status:** Internal Draft
 **Author:** Cédric BORNECQUE
 **Date:** July 4th 2026
@@ -20,6 +20,7 @@
 | 1.2     | Jul 4th 2026 | Cédric BORNECQUE | Added the `cal` schema (§6bis) closing the pending calendar-DDL dependency flagged by A12: `cal.collections`, `cal.events` (with the event detail incl. RRULE as the single CIPHERTEXT `event_ct`), `cal.event_envelopes` (calendar analogue of mail envelopes), and `cal.freebusy_projection` (consented server-visible metadata per A15-PROJ-6, deliberately NOT ciphertext). Schema-level integrity: `cal_allday_chk` and `cal_tzid_chk` make the two most common timezone bugs (all-day-with-tz, zoned-without-TZID) database-level violations (A21-CAL-2); UNIQUE(principal_id,event_uid,recurrence_id) enforces the master/override model (A21-CAL-3). Added `cal` to plane separation (A21-X-1). Re-validated the full DDL against the real PostgreSQL grammar — 44 statements parse cleanly, no forward-reference bugs. |
 | 1.3     | Jul 4th 2026 | Cédric BORNECQUE | Added §6ter closing the pending A27 (Shared Resources) DDL dependency: `keydir.resource_membership` (shared-mailbox role records — reuses the existing `keydir.mail_device_keys` table unchanged, keyed under the resource principal's own `principal_id`), `cal.delegation_grants` (calendar-delegation grant/revocation records, scope constrained to `calendar` only pending future mail-delegation), and `iam.groups`/`iam.group_members` (pure directory tables, no envelope/key linkage — a group is never a decryption target). Re-validated the full DDL against the real PostgreSQL grammar — 52 statements parse cleanly, no forward-reference bugs. |
 | 1.4     | Jul 4th 2026 | Cédric BORNECQUE | Added §7ter: `keydir.app_keys`, implementing the Tier 2 Applicative AppKey model discovered on review of the Diamy IAM – Integration Specification v1.6 (A17 v1.4 §4.2bis) — hash-only storage, per-app/platform isolation, structurally independent of `keydir.mail_device_keys` (authenticates the client application, not the user/device). Re-validated the full DDL — 54 statements parse cleanly, no forward-reference bugs. |
+| 1.5     | Jul 15th 2026 | Written by: session Claude Code — decision arbitrated by: Cédric BORNECQUE (project referent) | **Aligned the `hold_queue` schema (§2.6) on the key-only release design of A01-HOLD-5.** _Authorship vs. arbitration (traceability): this schema edit and its migration were written by a Claude Code session; the underlying design decision was arbitrated by Cédric BORNECQUE. Cédric explicitly validated option (a) of the A01/A21 hold divergence — amend A21 to permit the key-only hold design, per A01-HOLD-5 — following the escalation documented in `SIMPLIFICATIONS.md`. His confirmation was given directly to Hugo (out-of-band communication, outside this repository); this changelog entry records that decision but is not itself the evidence of it._ Reason: A01-HOLD-1/4/5 require hold release to re-wrap **`k_msg` only** and to NEVER reconstruct body plaintext (A01 §13 err.#8 names body reconstruction at release as an error); the prior `hold_queue` DDL (a single `ciphertext` column documented as "full message encrypted under k_hold", with no `message_id`) structurally forced the opposite — the body was sealed whole under `k_hold` and rebuilt at release. This was the A01/A21 divergence escalated on 2026-07-15; the option (a) resolution (amend A21, not A01) is Cédric's, per the confirmation noted above. Changes to §2.6: (1) added `message_id UUID NOT NULL REFERENCES mail.messages(message_id) ON DELETE CASCADE` — a held message is now **catalogued in `mail.messages` and its blobs stored under `k_msg` at reception**, exactly like an ordinary delivery but with zero device envelopes (A01-HOLD-1); (2) the ciphertext column now holds **`k_msg` wrapped under `k_hold`** (renamed `ciphertext`→`wrapped_kmsg`, `hold_nonce`→`wrap_nonce`) — never the body, which lives untouched in `mail.blobs`; (3) `sender_canonical` is now preserved (it is the `mail.messages` row's own column, populated at reception) — the prior design lost it. Release therefore only unwraps `k_msg` from `k_hold` and produces normal per-device envelopes (A02-CRY-4) against the pre-existing `message_id`; the body ciphertext is bit-for-bit unchanged. Rewrote A21-HOLD-1, updated the `CIPHERTEXT`-column lists (A21-X-2, §9.7). This resolves the divergence flagged in the v1.4 code notes and in SIMPLIFICATIONS.md — the physical migration is `0004_hold_queue_key_only.sql` (0003 left intact, already applied; migration discipline A21-X-4). |
 
 ------
 
@@ -171,18 +172,21 @@ CREATE INDEX idx_journal_principal_seq ON mail.journal(principal_id, seq);
 CREATE TABLE mail.hold_queue (
     hold_id         UUID PRIMARY KEY,                    -- UUIDv7
     principal_id    UUID NOT NULL,                       -- PLAINTEXT_METADATA (recipient with no active device)
-    tenant_id       UUID NOT NULL,
-    ciphertext      BYTEA NOT NULL,                      -- CIPHERTEXT: full message encrypted under server-side k_hold (A01-HOLD)
-    hold_nonce      BYTEA NOT NULL,                      -- PLAINTEXT_METADATA
+    tenant_id       UUID NOT NULL,                       -- PLAINTEXT_METADATA
+    message_id      UUID NOT NULL                        -- PLAINTEXT_METADATA: the ALREADY-CATALOGUED message (A01-HOLD-1)
+                        REFERENCES mail.messages(message_id) ON DELETE CASCADE,
+    wrapped_kmsg    BYTEA NOT NULL,                      -- CIPHERTEXT: k_msg (ONLY) wrapped under server-side k_hold (A01-HOLD-1/5) — NEVER the body
+    wrap_nonce      BYTEA NOT NULL,                      -- PLAINTEXT_METADATA: GCM nonce for wrapped_kmsg
     received_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at      TIMESTAMPTZ NOT NULL,                -- default +30d (A01-HOLD, tunable per onboarding profile A11-SEQ-4)
     CONSTRAINT hold_expiry_chk CHECK (expires_at > received_at)
 );
 CREATE INDEX idx_hold_principal ON mail.hold_queue(principal_id);
 CREATE INDEX idx_hold_expiry ON mail.hold_queue(expires_at);
+CREATE INDEX idx_hold_message ON mail.hold_queue(message_id);
 ```
 
-- **A21-HOLD-1**: The hold queue is the ONE data-plane store where the server holds a decryptable-by-server ciphertext (`k_hold`, a declared bounded exception, A01-HOLD / A00 §3.2). On the recipient's first device enrollment, held mail is re-encrypted into the normal envelope model and the hold row is deleted. `k_hold` is held in the secret store, never here.
+- **A21-HOLD-1**: The hold queue is the ONE data-plane store where the server holds a **wrapped `k_msg` it can itself unwrap** (`k_hold`, a declared bounded exception, A01-HOLD / A00 §3.2). It follows the **key-only** discipline of A01-HOLD-1/5 (which mirrors delegated re-wrap, A02-RW-1 — the frontier handles a *key*, never re-decrypts content): a held message is catalogued in `mail.messages` and its body/attachment/summary blobs stored under a fresh `k_msg` **at reception**, exactly like an ordinary delivery but with **zero** rows in `mail.envelopes` (no active device to wrap for yet). The `hold_queue` row carries only `k_msg` wrapped under `k_hold` (`wrapped_kmsg`), linked to that catalogued message by `message_id`. On the recipient's first device enrollment (A01-HOLD-4), release unwraps `k_msg` from `k_hold`, produces normal per-device envelopes (A02-CRY-4) against the **pre-existing** `message_id`, and deletes the hold row — **the body ciphertext in `mail.blobs` is never touched** (bit-for-bit unchanged). `k_hold` is held in the secret store, never here. This is why `message_id` is a real FK with `ON DELETE CASCADE`: deleting the catalogue message removes its hold row too, and the hold row can never reference a message that does not exist. `sender_canonical` and every other catalogue field are the `mail.messages` row's own columns — preserved through hold and release, never lost.
 
 ------
 
@@ -501,7 +505,7 @@ CREATE INDEX idx_appkey_hash_active ON keydir.app_keys(app_key_hash) WHERE statu
 # 7. Cross-Cutting Schema Rules
 
 - **A21-X-1** (plane separation): The schemas (`mail`, `keydir`, `search`, `cal`, `send`, `onboard`, `iam`) SHOULD be separable into distinct databases/roles if operational isolation demands it. `send`, `onboard`, and `iam` (group/resource-membership administration, A17-RESRC-5/A17-GRP-3) are control-plane (Super-Admin, SED-gated APIs, A23-API-2); `mail`/`keydir`/`search`/`cal` are data-plane (mail-plane token). DB roles MUST reflect this: the data-plane service role MUST NOT have write access to `send`/`onboard`/`iam`, and vice versa. Note that `keydir.resource_membership` and `cal.delegation_grants` (§6ter), despite living in data-plane schemas, hold entitlement/grant **metadata** consulted by data-plane services at read time — their read path is data-plane, but their write path (granting/revoking) MUST go through the control-plane admin APIs (A17-RESRC-5, A27-DEL-1), not direct data-plane writes.
-- **A21-X-2** (classification integrity): Every `CIPHERTEXT` column (`name_ct`, `summary_ct`, `hold_queue.ciphertext`) is opaque to the server. No index, constraint, or query may depend on its plaintext (there is none server-side). `BLIND_INDEX` columns (`bi_kw`, `bi_addr`) are matched by equality only, never inverted. Reclassifying any column requires a migration changelog entry (CDM-ENC-2).
+- **A21-X-2** (classification integrity): Every `CIPHERTEXT` column (`name_ct`, `summary_ct`, `hold_queue.wrapped_kmsg`) is opaque to the server. (`hold_queue.wrapped_kmsg` is `k_msg` wrapped under `k_hold` — server-unwrappable by design, A21-HOLD-1, the one declared exception INV-3; it is still opaque as stored, no index/query depends on its cleartext.) No index, constraint, or query may depend on its plaintext (there is none server-side). `BLIND_INDEX` columns (`bi_kw`, `bi_addr`) are matched by equality only, never inverted. Reclassifying any column requires a migration changelog entry (CDM-ENC-2).
 - **A21-X-3** (no plaintext oracles): No table may store a plaintext digest, a content hash used as a key, or any column that would let the server confirm a guessed plaintext (A02-CRY-6, A21-BLOB-1). All digests are over ciphertext.
 - **A21-X-4** (migrations): Schema changes ship as ordered, reversible migrations. A column classification change (metadata↔ciphertext↔blind-index) MUST have a corresponding CDM-ENC migration entry and a data-migration plan; it is never an in-place `ALTER` without re-encryption where the classification tightens.
 - **A21-X-5** (referential integrity vs privacy): FKs to IAM (`principal_id`, `tenant_id`, `device_id`) are logical/external — IAM owns those rows. This schema MUST NOT create physical FKs into IAM tables (plane coupling); it treats IAM IDs as opaque external references validated by the application/IAM contract (A17).
@@ -524,7 +528,7 @@ CREATE INDEX idx_appkey_hash_active ON keydir.app_keys(app_key_hash) WHERE statu
 4. **Plane separation**: data-plane role attempts to write `send.allocations` → denied by role grants (A21-X-1).
 5. **One pool per server**: set a server's `pool_id` to a second pool → the column holds one value; membership is single (A21-SEND-1, OPS-SEND-2).
 6. **Hybrid rules invariant**: `mode='hybrid'` with `hybrid_rules IS NULL` → rejected by `alloc_hybrid_rules_chk` (A21-SEND-1).
-7. **Ciphertext opacity**: verify no index or view exposes `summary_ct`/`name_ct`/hold `ciphertext` plaintext (there is none; assert no plaintext-derived column exists) (A21-X-2).
+7. **Ciphertext opacity**: verify no index or view exposes `summary_ct`/`name_ct`/hold `wrapped_kmsg` plaintext (there is none; assert no plaintext-derived column exists) (A21-X-2).
 8. **Direction/time integrity**: insert inbound message with NULL `received_at` → rejected by `messages_time_chk`.
 
 ------

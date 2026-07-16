@@ -24,8 +24,8 @@ rustls.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-# Uniquement pour les tests d'intégration de l'API de sync (client HTTPS réel) — et pour
-# `mint_dev_mail_plane_token`, qui n'existe QUE derrière ce feature de dev (jamais dans le
-# binaire de prod : le feature n'est activé qu'ici, en dev-dependencies).
+# Tests d'intégration de l'API de sync (client HTTPS réel). Ils LISENT un jeton mail-plane
+# pré-signé dans la fixture `tests/fixtures/dev_mail_plane_tokens.json` (jamais fabriqué —
+# INV-9 / A17-P-1 : seul IAM émet des jetons). `diamy-mail-iam` et `serde_json` sont déjà en
+# dépendances normales ci-dessus ; aucun feature "issuer" n'existe plus.
 reqwest.workspace = true
-diamy-mail-iam = { path = "../../crates/diamy-mail-iam", features = ["dev-token-issuer"] }

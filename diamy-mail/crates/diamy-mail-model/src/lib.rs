@@ -49,13 +49,68 @@ impl StoredMessage {
     }
 
     /// Classification déclarée de chaque champ (doc vivante + base d'un futur linter INV-2).
+    ///
+    /// Source de vérité : la DDL A21 (CDM-NULL-2) et A02 §4 (CDM-ENC-1). En particulier,
+    /// A02 §4.3 (footnote¹) classe `kem_ct` et `wrapped_key` comme **PLAINTEXT_METADATA**,
+    /// PAS CIPHERTEXT : ils sont « cryptographically opaque to the server (it holds no
+    /// ML-KEM private keys) but are classified metadata, not CIPHERTEXT, because the server
+    /// must serve them per device without decryption semantics ». Seul le contenu réel du
+    /// message est CIPHERTEXT : `body_ciphertext`, `summary_ct` (A02 §4.1) et le nom de
+    /// dossier `name_ct` (A02-DM-1).
     pub fn field_class(field: &str) -> Option<FieldClass> {
         Some(match field {
-            "body_ciphertext" | "wrapped_key" | "kem_ct" => FieldClass::Ciphertext,
-            "size_bytes" | "received_at_ms" | "recipient_id" | "tenant_id" => {
-                FieldClass::PlaintextMetadata
-            }
+            // CIPHERTEXT — contenu du message, jamais lisible côté serveur (INV-1).
+            "body_ciphertext" | "summary_ct" | "name_ct" => FieldClass::Ciphertext,
+            // PLAINTEXT_METADATA — routage/technique. kem_ct/wrapped_key : A02 §4.3 footnote¹
+            // (opaques au serveur mais métadonnées, pas ciphertext).
+            "kem_ct" | "wrapped_key" | "size_bytes" | "received_at_ms" | "recipient_id"
+            | "tenant_id" => FieldClass::PlaintextMetadata,
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verrou anti-désynchronisation avec A02 §4 (CDM-ENC-1) / DDL A21.
+    /// Toute future re-divergence de `field_class` avec la classification normative
+    /// casse ce test plutôt que de dormir silencieusement.
+    #[test]
+    fn field_class_matches_a02_classification() {
+        // A02 §4.3 footnote¹ : kem_ct et wrapped_key sont PLAINTEXT_METADATA, PAS CIPHERTEXT
+        // (opaques au serveur, mais servis par appareil sans sémantique de déchiffrement).
+        assert_eq!(
+            StoredMessage::field_class("kem_ct"),
+            Some(FieldClass::PlaintextMetadata),
+            "A02 §4.3 footnote¹ : kem_ct est PLAINTEXT_METADATA, pas CIPHERTEXT"
+        );
+        assert_eq!(
+            StoredMessage::field_class("wrapped_key"),
+            Some(FieldClass::PlaintextMetadata),
+            "A02 §4.3 footnote¹ : wrapped_key est PLAINTEXT_METADATA, pas CIPHERTEXT"
+        );
+
+        // Contenu réel du message = CIPHERTEXT (A02 §4.1 pour summary_ct, A02-DM-1 pour name_ct).
+        for f in ["body_ciphertext", "summary_ct", "name_ct"] {
+            assert_eq!(
+                StoredMessage::field_class(f),
+                Some(FieldClass::Ciphertext),
+                "{f} porte du contenu : CIPHERTEXT"
+            );
+        }
+
+        // Métadonnées de routage/technique = PLAINTEXT_METADATA.
+        for f in ["size_bytes", "received_at_ms", "recipient_id", "tenant_id"] {
+            assert_eq!(
+                StoredMessage::field_class(f),
+                Some(FieldClass::PlaintextMetadata),
+                "{f} est une métadonnée de routage : PLAINTEXT_METADATA"
+            );
+        }
+
+        // Champ inconnu → None : aucune classification n'est devinée.
+        assert_eq!(StoredMessage::field_class("champ_inconnu"), None);
     }
 }

@@ -16,9 +16,12 @@ conception introduit ici doit être répercuté dans l'annexe propriétaire (gui
 - **`diamy-addr`** : `diamy_addr_canon()` (A24) + type `CanonicalAddress` (type-state).
 - **`diamy-mail-iam`** : client de consommation IAM + `DevIamClient` (doublure, principaux `@w3.tel`).
 - **`diamy-mail-model`** : types miroir A21 avec classification de chiffrement (CDM-ENC).
-- **`diamy-obs`** : logs `tracing` (sans contenu, INV-21) + métriques Prometheus.
-- **`diamy-mxd`** : **démo du chemin vertical** (frontière → stockage chiffré → sync → déchiffrement vérifié).
-- **`diamy-maild`** : squelette + endpoint `/metrics` + garde-fou crypto au boot.
+- **`diamy-obs`** : logs `tracing` (sans contenu, INV-21) + métriques Prometheus (compteurs `diamy_events_total` + jauges `diamy_gauges`).
+- **`diamy-mail-render`** : conversion vers **Tiptap JSON à schéma fermé** (A08) — chemin `text/plain` uniquement pour cette maquette (voir `SIMPLIFICATIONS.md`) ; câblée dans la démo `read_test_mail`, qui n'affiche plus jamais le clair brut (INV-17).
+- **`diamy-mail-mime`** : parsing MIME/RFC 5322 (A01-PARSE, step 2) — wrapper autour de `mail-parser` ; sélectionne le corps texte/HTML authentique (jamais les en-têtes, jamais du HTML converti), pièces jointes détectées mais pas conservées tant que l'AV (A01-AV) n'existe pas.
+- **`diamy-mxd`** : **démo du chemin vertical** (frontière → parse MIME → stockage chiffré → sync → déchiffrement vérifié), vrai SMTP (STARTTLS) sur `:2525`, persistance Postgres réelle, **file de hold** (A01-HOLD, ferme A17-DIR-5) avec balayage de release périodique, endpoint `/metrics` sur `:9102` (compteurs/jauges réels branchés sur le pipeline).
+- **`diamy-maild`** : API de sync HTTPS authentifiée (AppKey Tier 2 + jeton mail-plane) + endpoint `/metrics` (`:9101`) + garde-fou crypto au boot.
+- **Dashboard Grafana** (`deploy/grafana/`) : datasource Prometheus + dashboard "Diamy Mail" provisionnés AUTOMATIQUEMENT au démarrage — aucun clic dans l'UI, `docker compose up` suffit (débit SMTP par résultat, profondeur de la file de hold, relâchements/purges, cibles up).
 - **`diamy-submitd`** : squelette (A10).
 
 ## Démarrer
@@ -36,8 +39,10 @@ cargo run -p diamy-mxd
 # 4. Service métriques (puis ouvrir http://localhost:9101)
 cargo run -p diamy-maild
 
-# 5. Observabilité (Postgres + Prometheus + Grafana)
+# 5. Observabilité (Postgres + Prometheus + Grafana, dashboard provisionné automatiquement)
 docker compose up -d
+# -> Grafana sur http://localhost:3001 (admin / devonly_change_me), dashboard "Diamy Mail"
+# -> Prometheus sur http://localhost:9091/targets (diamy-maild + diamy-mxd doivent être "up")
 ```
 
 Le garde-fou *fail-closed* se vérifie ainsi (le backend dev doit refuser un env non-dev) :
@@ -46,14 +51,23 @@ Le garde-fou *fail-closed* se vérifie ainsi (le backend dev doit refuser un env
 DIAMY_ENV=prod cargo run -p diamy-maild   # doit échouer au démarrage
 ```
 
-## Prochaines étapes (ordre suggéré, cf. Kit §7)
+## Prochaines étapes
 
-1. Câbler les **13 vecteurs A24** dans `diamy-addr` (gate CI).
-2. Stockage **Postgres via `sqlx`** (schéma A21) à la place du `StoredMessage` en mémoire.
-3. Vrai **MX SMTP** entrant (A01, avec Aubin) en amont de la frontière.
-4. **Sync native** (A04) signaux-seuls + client vault (A03/A19) + **rendu Tiptap** (A08).
-5. Le jour où le messaging est stable : implémenter le backend **`messaging-crypto`**
+**À trancher avec Cédric avant de coder autour (pas des chantiers de code) :**
+- `MAX_DATA_BYTES` : 10 Mo actuel vs 50 Mo recommandé par A02-QOS-2 — décision produit en attente.
+
+**Résolu (ne plus lister comme ouvert) :**
+- **`mint_dev_mail_plane_token` — capacité de fabrication de jeton de session retirée du code** (ex-ESCALADE INV-9/A17-P-1). La fonction qui signait un jeton de session valide à la volée a été ENTIÈREMENT supprimée (avec le feature `dev-token-issuer`) ; les tests et exemples LISENT désormais un jeu de jetons **pré-signés hors du code** (`tests/fixtures/dev_mail_plane_tokens.json`), et plus aucune fonction du repo ne sait en fabriquer. Ce point n'était PAS un vrai conflit de conception : la correction **retire** la violation au lieu de la justifier, donc **Hugo l'a pris en charge directement, sans arbitrage de Cédric**. Garanti par le test anti-régression repo-wide `crates/diamy-mail-iam/tests/no_token_minting_in_repo.rs`. Détail dans `SIMPLIFICATIONS.md`.
+- **Divergence A01/A21 sur la file de hold** — *tranchée par Cédric le 2026-07-15* (voir `SIMPLIFICATIONS.md`, ligne "ex-ESCALADE A01/A21"). A01-HOLD-5 ("body plaintext is NOT reconstructed") et l'ancien DDL `hold_queue` d'A21 décrivaient deux designs incompatibles ; Cédric (référent du projet) a validé l'option (a) — **amender A21** (passé en v1.5) pour porter le design **clé seule**, pas A01. Confirmation donnée directement à Hugo (hors dépôt) ; la modification a été écrite par une session Claude Code, la décision arbitrée par Cédric. Implémenté et vérifié de bout en bout.
+
+**Chantiers de code identifiés (aucun ne nécessite d'inventer un comportement non spécifié) :**
+1. Le jour où le messaging est stable : implémenter le backend **`messaging-crypto`**
    (labels HKDF + format d'enveloppe exacts) — **rien d'autre ne change** chez les appelants.
+2. Une fois l'AV (A01-AV) implémenté : étendre `diamy-mail-mime`/`diamy-mxd` pour conserver les pièces jointes séparément (aujourd'hui détectées mais volontairement pas conservées, voir `SIMPLIFICATIONS.md`).
+3. `k_hold` dérivé par un vrai `diamy-secretd` (Level A, A17-ENC-1) au lieu d'un secret d'env de dev, une fois ce service disponible.
+4. Observabilité : histogrammes de latence par étape du pipeline (A01 §11), jauge de profondeur de hold PAR TENANT (une jauge globale seulement pour l'instant), compteurs sur l'API de sync de `diamy-maild` (voir `SIMPLIFICATIONS.md`).
+
+*(Déjà fait, à ne pas refaire : les 13 vecteurs A24 sont câblés dans `diamy-addr` ; le stockage Postgres via `sqlx` remplace le `StoredMessage` en mémoire ; le SMTP entrant est réel avec STARTTLS ; la sync est authentifiée ; le rendu Tiptap couvre le chemin text/plain ; le parsing MIME/RFC 5322 (A01-PARSE) sélectionne le vrai corps du message ; la file de hold (A01-HOLD) accepte et relâche automatiquement ; l'AAD de l'enveloppe (A02-CRY-4) est câblée ; le dashboard Grafana est provisionné automatiquement avec des métriques réelles — voir `SIMPLIFICATIONS.md` pour le détail exact de ce qui reste simplifié dans chacun.)*
 
 ## Contacts
 - DNS / SPF / DKIM / DMARC de `w3.tel` → **Cédric** (référent de stage).

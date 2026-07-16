@@ -1,0 +1,11 @@
+[package]
+name = "diamy-mail-render"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Conversion vers Tiptap JSON à schéma fermé (A08). Maquette : chemin text/plain uniquement (A08-TXT-1) — voir SIMPLIFICATIONS.md pour le périmètre du pipeline HTML."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+unicode-normalization.workspace = true

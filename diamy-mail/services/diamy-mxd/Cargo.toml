@@ -10,6 +10,7 @@ diamy-mail-crypto = { path = "../../crates/diamy-mail-crypto" }
 diamy-mail-storage = { path = "../../crates/diamy-mail-storage" }
 diamy-mail-iam = { path = "../../crates/diamy-mail-iam" }
 diamy-addr = { path = "../../crates/diamy-addr" }
+diamy-mail-mime = { path = "../../crates/diamy-mail-mime" }
 diamy-obs = { path = "../../crates/diamy-obs" }
 tokio.workspace = true
 tracing.workspace = true

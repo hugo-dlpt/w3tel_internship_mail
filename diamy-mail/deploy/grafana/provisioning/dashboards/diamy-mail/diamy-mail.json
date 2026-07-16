@@ -1,0 +1,170 @@
+{
+  "id": null,
+  "uid": "diamy-mail",
+  "title": "Diamy Mail — squelette de maquette",
+  "description": "Observabilité de la maquette (A22, INV-21 : métadonnées uniquement, jamais de contenu). Provisionné automatiquement au démarrage — voir deploy/grafana/README.md.",
+  "tags": ["diamy-mail"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "diamy-mxd — passerelle entrante (A01)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Messages reçus",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "blue", "value": null }] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(diamy_events_total{service=\"diamy-mxd\", event=\"message_received\"})", "refId": "A" }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Livrés (chemin direct)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(diamy_events_total{service=\"diamy-mxd\", event=\"message_delivered\"})", "refId": "A" }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Tenus (A01-HOLD, zéro appareil)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "orange", "value": null }] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(diamy_events_total{service=\"diamy-mxd\", event=\"message_held\"})", "refId": "A" }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Relâchés depuis le hold",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(diamy_events_total{service=\"diamy-mxd\", event=\"hold_released\"})", "refId": "A" }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Rejetés / tempfail (tous motifs)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "red", "value": null }] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(diamy_events_total{service=\"diamy-mxd\", event=~\"tempfail_.*|message_rejected_.*|recipient_rejected\"})", "refId": "A" }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "gauge",
+      "title": "Profondeur file de hold (maintenant)",
+      "description": "A01 §11 / A22 : jauge, pas un compteur — reflète l'état courant de mail.hold_queue.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 100,
+          "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 20 }, { "color": "red", "value": 50 }] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "diamy_gauges{service=\"diamy-mxd\", gauge=\"hold_queue_depth\"}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Débit SMTP entrant par résultat (diamy-mxd)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 5 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 15, "spanNulls": true } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(diamy_events_total{service=\"diamy-mxd\", event=\"message_received\"}[1m]))", "legendFormat": "reçus", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(diamy_events_total{service=\"diamy-mxd\", event=\"message_delivered\"}[1m]))", "legendFormat": "livrés", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(diamy_events_total{service=\"diamy-mxd\", event=\"message_held\"}[1m]))", "legendFormat": "tenus (hold)", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(diamy_events_total{service=\"diamy-mxd\", event=~\"tempfail_.*\"}[1m]))", "legendFormat": "tempfail", "refId": "D" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(diamy_events_total{service=\"diamy-mxd\", event=~\"message_rejected_.*|recipient_rejected\"}[1m]))", "legendFormat": "rejetés", "refId": "E" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "File de hold (A01-HOLD) & diamy-maild",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "collapsed": false
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Hold — relâchés / expirés-purgés par minute",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "bars", "fillOpacity": 40 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(diamy_events_total{service=\"diamy-mxd\", event=\"hold_released\"}[1m]))", "legendFormat": "relâchés (A01-HOLD-4)", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(diamy_events_total{service=\"diamy-mxd\", event=\"hold_expired_purged\"}[1m]))", "legendFormat": "expirés purgés (A01-HOLD-3, sans DSN)", "refId": "B" }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Activité diamy-maild (API de sync)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (event) (rate(diamy_events_total{service=\"diamy-maild\"}[1m]))", "legendFormat": "{{event}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 40,
+      "type": "stat",
+      "title": "Cibles Prometheus up (diamy-maild / diamy-mxd)",
+      "description": "Santé du scrape lui-même — distinct des métriques métier (OBS-1, A22).",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 23 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "value_and_name" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "up{diamy_service=~\"diamy-.*\"}", "legendFormat": "{{diamy_service}}", "refId": "A" }
+      ]
+    }
+  ]
+}

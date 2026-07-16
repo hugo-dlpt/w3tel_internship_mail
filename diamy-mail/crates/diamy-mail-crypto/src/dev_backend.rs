@@ -67,7 +67,11 @@ pub fn seal_message(plaintext: &[u8], aad: &[u8]) -> Result<(Ciphertext, Message
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
     let (nonce, bytes) = aes_encrypt(&key, plaintext, aad)?;
-    Ok((Ciphertext { nonce, bytes }, MessageKey::from_bytes(key)))
+    // A02-CRY-7 : la version de suite est écrite au scellement (INV-7).
+    Ok((
+        Ciphertext { alg_version: AlgVersion::CURRENT, nonce, bytes },
+        MessageKey::from_bytes(key),
+    ))
 }
 
 pub fn open_message(
@@ -75,8 +79,16 @@ pub fn open_message(
     key: &MessageKey,
     aad: &[u8],
 ) -> Result<VerifiedPlaintext, CryptoError> {
-    let pt = aes_decrypt(key.as_bytes(), &ct.nonce, &ct.bytes, aad)?;
-    Ok(VerifiedPlaintext(pt))
+    // INV-7 / A18-CRY-4 : dispatch sur la version AU DÉCHIFFREMENT, `match` SANS catch-all.
+    // Ajouter une variante à `AlgVersion` casse la compilation ici tant qu'elle n'est pas
+    // traitée — jamais un `_ => devine`. Une version inconnue a déjà été rejetée en amont
+    // par `AlgVersion::from_i32` (fail-closed, INV-16).
+    match ct.alg_version {
+        AlgVersion::V1 => {
+            let pt = aes_decrypt(key.as_bytes(), &ct.nonce, &ct.bytes, aad)?;
+            Ok(VerifiedPlaintext(pt))
+        }
+    }
 }
 
 pub fn generate_device_keypair() -> Result<(DeviceEncPublicKey, DeviceEncSecretKey), CryptoError> {
@@ -91,6 +103,7 @@ pub fn generate_device_keypair() -> Result<(DeviceEncPublicKey, DeviceEncSecretK
 pub fn wrap_key_for_device(
     mk: &MessageKey,
     pk: &DeviceEncPublicKey,
+    aad: &[u8],
 ) -> Result<Envelope, CryptoError> {
     let ek_arr =
         ml_kem::Encoded::<Ek>::try_from(&pk.0[..]).map_err(|_| CryptoError::InvalidKeyMaterial)?;
@@ -98,35 +111,88 @@ pub fn wrap_key_for_device(
     let mut rng = OsRng;
     let (kem_ct, ss) = ek.encapsulate(&mut rng).map_err(|_| CryptoError::Kem)?;
     let kek = hkdf32(ss.as_slice(), INFO_ENVELOPE);
-    // AAD vide : comportement inchangé par rapport à avant ce correctif. L'AAD normative
-    // de l'enveloppe ("mailenv:"+message_id+":"+device_id, A02-CRY-4) est un gap DISTINCT
-    // de celui traité ici (body_ct/summary_ct sous seal_message) — hors périmètre de ce
-    // correctif ; signalé dans SIMPLIFICATIONS.md, pas comblé par hypothèse.
-    let (nonce, bytes) = aes_encrypt(&kek, mk.as_bytes(), &[])?;
+    // AAD normative de l'enveloppe ("mailenv:"+message_id+":"+device_id, A02-CRY-4) —
+    // câblée (gap comblé, voir SIMPLIFICATIONS.md pour l'historique : c'était un gap
+    // DISTINCT de celui déjà corrigé sur body_ct/summary_ct sous seal_message).
+    let (nonce, bytes) = aes_encrypt(&kek, mk.as_bytes(), aad)?;
     Ok(Envelope {
         kem_ct: kem_ct.to_vec(),
-        wrapped: Ciphertext { nonce, bytes },
+        // A02-CRY-7 : version écrite au scellement de l'enveloppe (INV-7).
+        wrapped: Ciphertext { alg_version: AlgVersion::CURRENT, nonce, bytes },
     })
 }
 
-pub fn unwrap_key(env: &Envelope, sk: &DeviceEncSecretKey) -> Result<MessageKey, CryptoError> {
-    let dk_arr = ml_kem::Encoded::<Dk>::try_from(sk.as_bytes())
-        .map_err(|_| CryptoError::InvalidKeyMaterial)?;
-    let dk = Dk::from_bytes(&dk_arr);
-    let ct_arr = ml_kem::Ciphertext::<MlKem768>::try_from(&env.kem_ct[..])
-        .map_err(|_| CryptoError::InvalidKeyMaterial)?;
-    let ss = dk.decapsulate(&ct_arr).map_err(|_| CryptoError::Kem)?;
-    let kek = hkdf32(ss.as_slice(), INFO_ENVELOPE);
-    let raw = aes_decrypt(&kek, &env.wrapped.nonce, &env.wrapped.bytes, &[])?; // voir note AAD vide ci-dessus (wrap_key_for_device)
-    let arr: [u8; 32] = raw
-        .as_slice()
-        .try_into()
-        .map_err(|_| CryptoError::DecryptVerify)?;
-    Ok(MessageKey::from_bytes(arr))
+pub fn unwrap_key(env: &Envelope, sk: &DeviceEncSecretKey, aad: &[u8]) -> Result<MessageKey, CryptoError> {
+    // INV-7 / A18-CRY-4 : la version de l'enveloppe (portée par son chiffré emballé) est
+    // dispatchée AU DÉCHIFFREMENT, `match` SANS catch-all.
+    match env.wrapped.alg_version {
+        AlgVersion::V1 => {
+            let dk_arr = ml_kem::Encoded::<Dk>::try_from(sk.as_bytes())
+                .map_err(|_| CryptoError::InvalidKeyMaterial)?;
+            let dk = Dk::from_bytes(&dk_arr);
+            let ct_arr = ml_kem::Ciphertext::<MlKem768>::try_from(&env.kem_ct[..])
+                .map_err(|_| CryptoError::InvalidKeyMaterial)?;
+            let ss = dk.decapsulate(&ct_arr).map_err(|_| CryptoError::Kem)?;
+            let kek = hkdf32(ss.as_slice(), INFO_ENVELOPE);
+            let raw = aes_decrypt(&kek, &env.wrapped.nonce, &env.wrapped.bytes, aad)?; // AAD A02-CRY-4
+            let arr: [u8; 32] = raw
+                .as_slice()
+                .try_into()
+                .map_err(|_| CryptoError::DecryptVerify)?;
+            Ok(MessageKey::from_bytes(arr))
+        }
+    }
 }
 
 pub fn derive_key(secret: &[u8], info: &[u8]) -> Result<DerivedKey, CryptoError> {
     Ok(DerivedKey(hkdf32(secret, info)))
+}
+
+pub fn seal_with_key(plaintext: &[u8], key: &DerivedKey, aad: &[u8]) -> Result<Ciphertext, CryptoError> {
+    let (nonce, bytes) = aes_encrypt(key.expose(), plaintext, aad)?;
+    Ok(Ciphertext { alg_version: AlgVersion::CURRENT, nonce, bytes })
+}
+
+pub fn open_with_key(ct: &Ciphertext, key: &DerivedKey, aad: &[u8]) -> Result<VerifiedPlaintext, CryptoError> {
+    // INV-7 / A18-CRY-4 : dispatch sur la version AU DÉCHIFFREMENT, `match` SANS catch-all.
+    match ct.alg_version {
+        AlgVersion::V1 => {
+            let pt = aes_decrypt(key.expose(), &ct.nonce, &ct.bytes, aad)?;
+            Ok(VerifiedPlaintext(pt))
+        }
+    }
+}
+
+pub fn wrap_message_key_under_hold(
+    mk: &MessageKey,
+    k_hold: &DerivedKey,
+    aad: &[u8],
+) -> Result<Ciphertext, CryptoError> {
+    // A01-HOLD-1 (clé seule) : on scelle les 32 octets de k_msg sous k_hold — jamais le
+    // corps. Symétrique (k_hold EST la clé), pas de KEM ici, contrairement à
+    // `wrap_key_for_device`.
+    let (nonce, bytes) = aes_encrypt(k_hold.expose(), mk.as_bytes(), aad)?;
+    Ok(Ciphertext { alg_version: AlgVersion::CURRENT, nonce, bytes })
+}
+
+pub fn unwrap_message_key_from_hold(
+    ct: &Ciphertext,
+    k_hold: &DerivedKey,
+    aad: &[u8],
+) -> Result<MessageKey, CryptoError> {
+    // INV-7 / A18-CRY-4 : dispatch sur la version AU DÉCHIFFREMENT, `match` SANS catch-all
+    // (5e site de dispatch, comme `open_message`/`unwrap_key`/`open_with_key`) — ajouter une
+    // variante à `AlgVersion` casse la compilation ici tant qu'elle n'est pas traitée.
+    match ct.alg_version {
+        AlgVersion::V1 => {
+            let raw = aes_decrypt(k_hold.expose(), &ct.nonce, &ct.bytes, aad)?;
+            let arr: [u8; 32] = raw
+                .as_slice()
+                .try_into()
+                .map_err(|_| CryptoError::DecryptVerify)?;
+            Ok(MessageKey::from_bytes(arr))
+        }
+    }
 }
 
 pub fn generate_identity_keypair() -> Result<(IdentityPublicKey, IdentitySecretKey), CryptoError> {

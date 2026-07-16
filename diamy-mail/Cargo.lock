@@ -464,8 +464,16 @@ dependencies = [
  "diamy-addr",
  "jsonwebtoken",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "uuid",
+]
+
+[[package]]
+name = "diamy-mail-mime"
+version = "0.0.1"
+dependencies = [
+ "mail-parser",
 ]
 
 [[package]]
@@ -476,6 +484,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "diamy-mail-render"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "diamy-mail-storage"
 version = "0.0.1"
 dependencies = [
@@ -483,6 +500,8 @@ dependencies = [
  "diamy-addr",
  "diamy-mail-crypto",
  "diamy-mail-iam",
+ "diamy-mail-render",
+ "diamy-obs",
  "reqwest",
  "serde",
  "serde_json",
@@ -523,6 +542,7 @@ dependencies = [
  "diamy-addr",
  "diamy-mail-crypto",
  "diamy-mail-iam",
+ "diamy-mail-mime",
  "diamy-mail-storage",
  "diamy-obs",
  "rcgen",
@@ -542,6 +562,7 @@ version = "0.0.1"
 dependencies = [
  "prometheus",
  "rlimit",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -881,6 +902,18 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "hashify"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd1246c0e5493286aeb2dde35b1f4eb9c4ce00e628641210a5e553fc001a1f26"
+dependencies = [
+ "indexmap",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
 
 [[package]]
 name = "hashlink"
@@ -1323,6 +1356,15 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "mail-parser"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47785d444be4d32c1709171c6219a90f667c0ad0ffe68b4b179e794f31f4f9e8"
+dependencies = [
+ "hashify",
+]
 
 [[package]]
 name = "matchers"

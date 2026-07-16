@@ -94,6 +94,14 @@ impl AppKeyStore {
     }
 }
 
+/// Comparaison de l'AppKey par **hash-then-compare** : on hache la clé brute en SHA-256
+/// puis on cherche le hash dans la `HashMap`. C'est un choix DÉFENDABLE face à A18-ERR-4 /
+/// forbidden-pattern #7 (« jamais `==` sur un secret »), PAS un raccourci de sécurité : la
+/// comparaison finale porte sur le *digest* de 32 octets, jamais sur la clé brute. Un canal
+/// temporel sur la comparaison du hash ne révèle pas la clé (l'attaquant ne contrôle pas le
+/// hash stocké et ne peut pas remonter un préimage SHA-256 depuis un timing). Le tag GCM et
+/// la signature HS256 du jeton, eux, sont vérifiés en temps constant par `aes-gcm` /
+/// `jsonwebtoken`. Voir `SIMPLIFICATIONS.md`.
 fn hash_key(raw: &[u8]) -> [u8; 32] {
     Sha256::digest(raw).into()
 }

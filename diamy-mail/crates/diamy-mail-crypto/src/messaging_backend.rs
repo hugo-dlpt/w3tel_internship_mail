@@ -34,13 +34,34 @@ pub fn generate_device_keypair() -> Result<(DeviceEncPublicKey, DeviceEncSecretK
 pub fn wrap_key_for_device(
     _mk: &MessageKey,
     _pk: &DeviceEncPublicKey,
+    _aad: &[u8],
 ) -> Result<Envelope, CryptoError> {
     not_wired()
 }
-pub fn unwrap_key(_env: &Envelope, _sk: &DeviceEncSecretKey) -> Result<MessageKey, CryptoError> {
+pub fn unwrap_key(_env: &Envelope, _sk: &DeviceEncSecretKey, _aad: &[u8]) -> Result<MessageKey, CryptoError> {
     not_wired()
 }
 pub fn derive_key(_secret: &[u8], _info: &[u8]) -> Result<DerivedKey, CryptoError> {
+    not_wired()
+}
+pub fn seal_with_key(_plaintext: &[u8], _key: &DerivedKey, _aad: &[u8]) -> Result<Ciphertext, CryptoError> {
+    not_wired()
+}
+pub fn open_with_key(_ct: &Ciphertext, _key: &DerivedKey, _aad: &[u8]) -> Result<VerifiedPlaintext, CryptoError> {
+    not_wired()
+}
+pub fn wrap_message_key_under_hold(
+    _mk: &MessageKey,
+    _k_hold: &DerivedKey,
+    _aad: &[u8],
+) -> Result<Ciphertext, CryptoError> {
+    not_wired()
+}
+pub fn unwrap_message_key_from_hold(
+    _ct: &Ciphertext,
+    _k_hold: &DerivedKey,
+    _aad: &[u8],
+) -> Result<MessageKey, CryptoError> {
     not_wired()
 }
 pub fn generate_identity_keypair() -> Result<(IdentityPublicKey, IdentitySecretKey), CryptoError> {

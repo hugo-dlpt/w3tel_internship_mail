@@ -6,13 +6,18 @@
 //! adresse (au-delà du routage), clé ni jeton. Uniquement des compteurs, des IDs, des métadonnées.
 #![forbid(unsafe_code)]
 
-use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
+
+pub mod audit;
 
 /// Poignée d'observabilité d'un service.
 pub struct Obs {
     pub registry: Registry,
     /// Événements comptés par (service, type d'événement). Métadonnées uniquement.
     pub events: IntCounterVec,
+    /// État courant par (service, jauge) — ex. profondeur de la file de hold (A01 §11,
+    /// A22). Contrairement à `events`, une jauge peut aussi bien monter que descendre.
+    pub gauges: IntGaugeVec,
 }
 
 impl Obs {
@@ -32,7 +37,20 @@ impl Obs {
             .expect("enregistrement compteur");
         // amorce la série pour ce service
         events.with_label_values(&[service, "startup"]).inc();
-        Self { registry, events }
+
+        let gauges = IntGaugeVec::new(
+            Opts::new(
+                "diamy_gauges",
+                "État courant par service (métadonnées seules, ex. profondeur de file)",
+            ),
+            &["service", "gauge"],
+        )
+        .expect("jauge valide");
+        registry
+            .register(Box::new(gauges.clone()))
+            .expect("enregistrement jauge");
+
+        Self { registry, events, gauges }
     }
 
     /// Rend les métriques au format texte Prometheus (exposition sur `/metrics`).

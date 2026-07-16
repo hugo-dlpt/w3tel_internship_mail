@@ -6,6 +6,8 @@ members = [
   "crates/diamy-mail-storage",
   "crates/diamy-mail-iam",
   "crates/diamy-addr",
+  "crates/diamy-mail-render",
+  "crates/diamy-mail-mime",
   "crates/diamy-obs",
   "services/diamy-mxd",
   "services/diamy-maild",

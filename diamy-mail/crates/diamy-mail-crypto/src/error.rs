@@ -18,4 +18,6 @@ pub enum CryptoError {
     DevBackendInProd,
     #[error("backend `messaging-crypto` pas encore branché : {0}")]
     MessagingBackendNotWired(&'static str),
+    #[error("version d'algorithme inconnue au déchiffrement : {0} (fail-closed, A02-CRY-7 / INV-7)")]
+    UnknownAlgVersion(i32),
 }

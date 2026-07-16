@@ -4,6 +4,7 @@
 //! Squelette. Rappels normatifs à respecter dès l'implémentation :
 //!   - SEC-OUT-2 : pas d'envoi tant que SPF/DKIM/DMARC ne sont pas alignés (fail-closed).
 //!   - SEC-OUT-1 : rate limit par expéditeur + compteur de destinataires uniques + circuit-breaker.
+#![forbid(unsafe_code)] // A18-CI-2 : aucun `unsafe` dans ce service (comme les 8 crates)
 
 use diamy_mail_crypto as crypto;
 

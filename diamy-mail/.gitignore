@@ -15,3 +15,8 @@ Cargo.lock.orig
 # privées, même de test) ni exister en dehors de cette machine de dev.
 /dev_secrets/
 /crates/diamy-mail-storage/dev_secrets/
+
+# Sink d'audit distinct (INV-20, A18-LOG-3) — JSON-lines des actions privilégiées.
+# Local à la machine de dev ; un vrai déploiement l'envoie à un sink d'audit durable.
+/audit_log/
+**/audit_log/

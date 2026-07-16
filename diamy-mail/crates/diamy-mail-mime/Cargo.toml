@@ -1,0 +1,9 @@
+[package]
+name = "diamy-mail-mime"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Parsing MIME/RFC 5322 borné et tolérant aux pannes (A01-PARSE, pipeline step 2) — frontière uniquement, jamais de crypto ni d'analyse de confiance ici (A01 §1.1)."
+
+[dependencies]
+mail-parser = "0.11"

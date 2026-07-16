@@ -1,0 +1,15 @@
+# Provisionne le dashboard "Diamy Mail" depuis un fichier au démarrage — pas de dashboard
+# vide à configurer à la main (guide Kit §9 : "un dashboard vide s'affiche" -> désormais
+# non-vide dès `docker compose up`).
+apiVersion: 1
+
+providers:
+  - name: "Diamy Mail"
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/diamy-mail

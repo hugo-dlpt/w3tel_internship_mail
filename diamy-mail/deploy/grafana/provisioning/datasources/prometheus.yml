@@ -1,0 +1,14 @@
+# Provisionne automatiquement la source de données Prometheus au démarrage de Grafana —
+# aucune config manuelle dans l'UI (guide §7 étape 0 : observabilité dès le départ).
+# `prometheus` = nom du service docker-compose, résolu sur le réseau interne (PAS le
+# port hôte 9091 exposé pour un accès humain — Grafana parle au conteneur directement).
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

@@ -1,0 +1,58 @@
+{
+  "_README": [
+    "Jetons de test mail-plane PRÉ-SIGNÉS, générés UNE SEULE FOIS hors du code de production",
+    "(calcul HMAC-SHA256 one-shot, script jamais versionné dans ce repo). En clair car ce sont",
+    "des jetons de DEV/TEST sans aucune valeur réelle.",
+    "",
+    "Ne JAMAIS utiliser en dehors de l'environnement de dev/test.",
+    "AUCUNE fonction du projet ne doit savoir régénérer ces jetons : la CAPACITÉ d'émettre un",
+    "jeton de session valide a été RETIRÉE du code (INV-9 / A17-P-1 : « Diamy Mail MUST NOT mint",
+    "identity or session tokens » — seul IAM en émet). Les tests et exemples se contentent de LIRE",
+    "ce fichier ; ils ne fabriquent jamais de jeton. Un test anti-régression",
+    "(crates/diamy-mail-iam/tests/no_token_minting_in_repo.rs) échoue si une fonction de signature",
+    "de jeton réapparaît quelque part dans le repo.",
+    "",
+    "Mécanisme (identique à l'ancien mint_dev_mail_plane_token, désormais SUPPRIMÉ) : JWT HS256,",
+    "claims { sub = principal_id, iat, exp }. Le principal_id est l'UUIDv5 (namespace DNS) de",
+    "l'adresse canonique, EXACTEMENT comme DevIamClient::seeded() le dérive (hugo/cedric/aubin",
+    "@w3.tel). Le secret HS256 ci-dessous est le secret de dev par défaut du serveur",
+    "(MAIL_JWT_TOKEN dans diamy-maild/src/main.rs) : les jetons vérifient donc sans surcharge",
+    "d'environnement. Si tu surcharges MAIL_JWT_TOKEN côté serveur, ces jetons figés ne",
+    "vérifieront plus (comportement attendu — il faudrait alors une vraie session émise par IAM).",
+    "",
+    "Les jetons 'valides' portent un exp très lointain (2100-01-01) : figés une fois, ils ne",
+    "périment jamais en dev. Le jeton 'expired' porte un exp figé dans le passé (2020-01-01) : il",
+    "sert UNIQUEMENT à prouver le rejet par expiration (verify_mail_plane_token, leeway=0)."
+  ],
+  "secret": "devonly_change_me_mail_jwt_secret",
+  "tokens": {
+    "valid_hugo": {
+      "address": "hugo@w3.tel",
+      "principal_id": "ac76e297-7762-58ed-8b6d-d60f34848554",
+      "expired": false,
+      "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhYzc2ZTI5Ny03NzYyLTU4ZWQtOGI2ZC1kNjBmMzQ4NDg1NTQiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6NDEwMjQ0NDgwMH0.Lvwzth5Vk0oE7kNytIVwEgM5_JGKGFepCEbC8HVoT8I",
+      "note": "Valide (exp 2100). Principal seeded avec appareil actif enrôlé via `enroll_test_device`. Défaut de l'exemple `read_test_mail`."
+    },
+    "valid_cedric": {
+      "address": "cedric@w3.tel",
+      "principal_id": "f1f4ba46-0de5-5e49-aec4-c7d98a0c37b4",
+      "expired": false,
+      "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmMWY0YmE0Ni0wZGU1LTVlNDktYWVjNC1jN2Q5OGEwYzM3YjQiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6NDEwMjQ0NDgwMH0.GF2WReYALDgt80YvvjTZ3IAsy6PTYhpMQOqQcZLpgys",
+      "note": "Valide (exp 2100). Utilisé par le round-trip HTTP de sync_api (un appareil lui est enrôlé dans le test)."
+    },
+    "valid_aubin": {
+      "address": "aubin@w3.tel",
+      "principal_id": "ff26e444-9116-5244-bb98-fbfb299f8fb9",
+      "expired": false,
+      "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmZjI2ZTQ0NC05MTE2LTUyNDQtYmI5OC1mYmZiMjk5ZjhmYjkiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6NDEwMjQ0NDgwMH0.bbyghE_UwhLUdW3tN93tvyPX3TfbsFrQzxLKl7jEsdc",
+      "note": "Valide (exp 2100). Principal seeded SANS appareil par défaut : cas « principal_id valide sans device »."
+    },
+    "expired": {
+      "address": "hugo@w3.tel",
+      "principal_id": "ac76e297-7762-58ed-8b6d-d60f34848554",
+      "expired": true,
+      "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhYzc2ZTI5Ny03NzYyLTU4ZWQtOGI2ZC1kNjBmMzQ4NDg1NTQiLCJpYXQiOjE1Nzc4MzY4MDAsImV4cCI6MTU3NzgzNzcwMH0.APPl1H0aJTrwtJUDuxSqd-qLi5EiOXPcnHy8d2NZ-JE",
+      "note": "EXPIRÉ (exp figé en 2020). Sert à prouver le rejet MailPlaneTokenError::Expired. Ne jamais l'utiliser pour un chemin heureux."
+    }
+  }
+}

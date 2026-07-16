@@ -90,8 +90,13 @@ struct FetchedDto {
     /// cet id, `open_message` échoue par construction (AAD différente de celle du
     /// scellement, fail-closed INV-8/16).
     body_blob_id: Uuid,
+    /// A02-CRY-7 : la version de suite voyage avec le chiffré pour que le client puisse la
+    /// re-contrôler avant `open_message` (INV-7). Le serveur l'a déjà validée (fail-closed)
+    /// en lisant `mail.blobs.blob_alg_version` / `mail.envelopes.alg_version`.
+    body_alg_version: i32,
     body_nonce_b64: String,
     body_ciphertext_b64: String,
+    envelope_alg_version: i32,
     envelope_kem_ct_b64: String,
     envelope_wrap_nonce_b64: String,
     envelope_wrapped_key_b64: String,
@@ -126,8 +131,10 @@ async fn fetch_message(
 
     Ok(Json(FetchedDto {
         body_blob_id: fetched.body_blob_id,
+        body_alg_version: fetched.body_ct.alg_version.as_i32(),
         body_nonce_b64: STANDARD.encode(fetched.body_ct.nonce),
         body_ciphertext_b64: STANDARD.encode(&fetched.body_ct.bytes),
+        envelope_alg_version: fetched.envelope.wrapped.alg_version.as_i32(),
         envelope_kem_ct_b64: STANDARD.encode(&fetched.envelope.kem_ct),
         envelope_wrap_nonce_b64: STANDARD.encode(fetched.envelope.wrapped.nonce),
         envelope_wrapped_key_b64: STANDARD.encode(&fetched.envelope.wrapped.bytes),
@@ -177,20 +184,47 @@ mod tests {
     const TEST_APPKEY_RAW: &str = "test-only-appkey-do-not-use-elsewhere";
     const TEST_APPKEY_NAME: &str = "diamy-mail-dev-client";
     const TEST_APPKEY_PLATFORM: &str = "dev";
-    const TEST_MAIL_JWT_SECRET: &[u8] = b"test-only-mail-jwt-secret-do-not-use-elsewhere";
+
+    // --- Jetons mail-plane PRÉ-SIGNÉS (INV-9 / A17-P-1 : seul IAM émet des jetons ; aucune
+    // fonction du repo ne sait en fabriquer). Ces tests LISENT un jeton figé dans la fixture,
+    // ils n'en fabriquent jamais. Le secret HS256 de la fixture DOIT être celui avec lequel le
+    // middleware d'auth vérifie (`test_auth_state`) — d'où la source unique ci-dessous.
+    const MAIL_PLANE_FIXTURES: &str =
+        include_str!("../../../tests/fixtures/dev_mail_plane_tokens.json");
+
+    fn fixtures() -> serde_json::Value {
+        serde_json::from_str(MAIL_PLANE_FIXTURES).expect("fixture de jetons JSON valide")
+    }
+    fn fixture_secret() -> Vec<u8> {
+        fixtures()["secret"].as_str().expect("champ `secret`").as_bytes().to_vec()
+    }
+    fn fixture_token(name: &str) -> String {
+        fixtures()["tokens"][name]["token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("jeton `{name}` présent dans la fixture"))
+            .to_string()
+    }
+    fn fixture_principal(name: &str) -> Uuid {
+        fixtures()["tokens"][name]["principal_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("principal_id de `{name}`"))
+            .parse()
+            .expect("principal_id UUID valide")
+    }
 
     fn test_auth_state() -> AuthState {
         std::env::set_var("DIAMY_MAILD_DEV_APPKEY", TEST_APPKEY_RAW);
         AuthState {
             app_keys: AppKeyStore::seeded_from_env(),
-            mail_jwt_secret: TEST_MAIL_JWT_SECRET.to_vec(),
+            // MÊME secret que celui utilisé pour pré-signer les jetons de la fixture.
+            mail_jwt_secret: fixture_secret(),
         }
     }
 
-    /// Requête GET portant les DEUX informations d'identification valides (A17-APPKEY-5)
-    /// pour `principal_id` — le chemin heureux que la plupart des tests exercent.
-    fn authed_get(client: &reqwest::Client, url: &str, principal_id: Uuid) -> reqwest::RequestBuilder {
-        let token = diamy_mail_iam::mint_dev_mail_plane_token(TEST_MAIL_JWT_SECRET, principal_id, 900);
+    /// Requête GET portant les DEUX informations d'identification valides (A17-APPKEY-5) :
+    /// l'AppKey Tier 2 et un jeton mail-plane pré-signé (fourni tel quel par l'appelant, lu
+    /// depuis la fixture — jamais fabriqué). Le chemin heureux que la plupart des tests exercent.
+    fn authed_get(client: &reqwest::Client, url: &str, token: &str) -> reqwest::RequestBuilder {
         client
             .get(url)
             .header("x-app-key", TEST_APPKEY_RAW)
@@ -275,8 +309,12 @@ mod tests {
 
         let devices = storage::active_device_keys(pool, principal_id).await.unwrap();
         let (_, mlkem_pub) = devices.into_iter().find(|(id, _)| *id == device_id).unwrap();
-        let envelope =
-            crypto::wrap_key_for_device(&message_key, &crypto::DeviceEncPublicKey(mlkem_pub)).unwrap();
+        let envelope = crypto::wrap_key_for_device(
+            &message_key,
+            &crypto::DeviceEncPublicKey(mlkem_pub),
+            &crypto::aad_for_envelope(message_id, device_id),
+        )
+        .unwrap();
         drop(message_key);
 
         let (folder_name_ct, folder_key) =
@@ -333,6 +371,10 @@ mod tests {
         let (state, pool) = test_state().await;
         let iam = diamy_mail_iam::DevIamClient::seeded();
         let principal = iam.resolve_principal("cedric@w3.tel").unwrap();
+        // Le jeton pré-signé `valid_cedric` porte le principal_id de cedric@w3.tel : c'est le
+        // MÊME UUIDv5 que celui dérivé par DevIamClient::seeded(), donc la fixture reste
+        // cohérente avec l'IAM de dev sans qu'aucune fabrication de jeton ne soit nécessaire.
+        assert_eq!(principal.id, fixture_principal("valid_cedric"));
         let (device_id, device_sec) = enroll_device_for_test(&pool, principal.id).await;
 
         let marker = format!("marqueur-{}", Uuid::now_v7());
@@ -343,7 +385,7 @@ mod tests {
         let client = test_https_client();
 
         let list_url = format!("{base_url}/v1/mailbox/{}/messages", principal.id);
-        let messages: Vec<serde_json::Value> = authed_get(&client, &list_url, principal.id)
+        let messages: Vec<serde_json::Value> = authed_get(&client, &list_url, &fixture_token("valid_cedric"))
             .send()
             .await
             .unwrap()
@@ -359,7 +401,7 @@ mod tests {
             "{base_url}/v1/mailbox/{}/messages/{message_id}?device_id={device_id}",
             principal.id
         );
-        let resp = authed_get(&client, &fetch_url, principal.id).send().await.unwrap();
+        let resp = authed_get(&client, &fetch_url, &fixture_token("valid_cedric")).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         let dto: serde_json::Value = resp.json().await.unwrap();
 
@@ -369,7 +411,9 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
+        // INV-7 : le client re-contrôle la version reçue sur le fil avant tout `open_*`.
         let body_ct = crypto::Ciphertext {
+            alg_version: crypto::AlgVersion::from_i32(dto["body_alg_version"].as_i64().unwrap() as i32).unwrap(),
             nonce,
             bytes: STANDARD.decode(dto["body_ciphertext_b64"].as_str().unwrap()).unwrap(),
         };
@@ -381,6 +425,7 @@ mod tests {
         let envelope = crypto::Envelope {
             kem_ct: STANDARD.decode(dto["envelope_kem_ct_b64"].as_str().unwrap()).unwrap(),
             wrapped: crypto::Ciphertext {
+                alg_version: crypto::AlgVersion::from_i32(dto["envelope_alg_version"].as_i64().unwrap() as i32).unwrap(),
                 nonce: wrap_nonce,
                 bytes: STANDARD
                     .decode(dto["envelope_wrapped_key_b64"].as_str().unwrap())
@@ -389,7 +434,8 @@ mod tests {
         };
 
         let body_blob_id: Uuid = dto["body_blob_id"].as_str().unwrap().parse().unwrap();
-        let key = crypto::unwrap_key(&envelope, &device_sec).unwrap();
+        let key = crypto::unwrap_key(&envelope, &device_sec, &crypto::aad_for_envelope(message_id, device_id))
+            .unwrap();
         let aad = crypto::aad_for_blob(message_id, body_blob_id);
         let verified = crypto::open_message(&body_ct, &key, &aad).unwrap();
         assert!(String::from_utf8_lossy(verified.as_bytes()).contains(&marker));
@@ -405,6 +451,8 @@ mod tests {
         let (state, pool) = test_state().await;
         let iam = diamy_mail_iam::DevIamClient::seeded();
         let principal = iam.resolve_principal("cedric@w3.tel").unwrap();
+        // Cohérence fixture↔IAM (voir round-trip) : `valid_cedric` == principal_id de cedric.
+        assert_eq!(principal.id, fixture_principal("valid_cedric"));
         let (device_id, _device_sec) = enroll_device_for_test(&pool, principal.id).await;
         let marker = format!("marqueur-{}", Uuid::now_v7());
         let message_id =
@@ -419,7 +467,7 @@ mod tests {
         // Authentifié comme le VRAI propriétaire (`principal.id`), mais l'URL demande la
         // boîte d'un AUTRE principal (`wrong_principal`) : doit échouer malgré une
         // authentification par ailleurs valide.
-        let resp = authed_get(&client, &fetch_url, principal.id).send().await.unwrap();
+        let resp = authed_get(&client, &fetch_url, &fixture_token("valid_cedric")).send().await.unwrap();
         assert_eq!(resp.status(), 404, "un mauvais principal_id doit être rejeté");
     }
 
@@ -432,13 +480,16 @@ mod tests {
         let base_url = spawn_test_api(state).await;
         let client = test_https_client();
 
-        let random_principal = Uuid::now_v7();
+        // Principal AUTHENTIFIÉ et AUTORISÉ sur SA PROPRE boîte (aubin, jeton pré-signé lu dans
+        // la fixture), mais demandant un message inexistant : l'autorisation passe (sub ==
+        // principal de l'URL), puis la recherche échoue -> 404 générique (pas de 500, pas de fuite).
+        let principal_id = fixture_principal("valid_aubin");
         let random_message = Uuid::now_v7();
         let random_device = Uuid::now_v7();
         let fetch_url = format!(
-            "{base_url}/v1/mailbox/{random_principal}/messages/{random_message}?device_id={random_device}"
+            "{base_url}/v1/mailbox/{principal_id}/messages/{random_message}?device_id={random_device}"
         );
-        let resp = authed_get(&client, &fetch_url, random_principal).send().await.unwrap();
+        let resp = authed_get(&client, &fetch_url, &fixture_token("valid_aubin")).send().await.unwrap();
         assert_eq!(resp.status(), 404);
     }
 
@@ -524,8 +575,11 @@ mod tests {
         let base_url = spawn_test_api(state).await;
         let client = test_https_client();
 
-        let principal_id = Uuid::now_v7();
-        let token = diamy_mail_iam::mint_dev_mail_plane_token(TEST_MAIL_JWT_SECRET, principal_id, 900);
+        // Jeton mail-plane pré-signé valide (lu dans la fixture), mais il ne sera JAMAIS
+        // examiné : l'étape 1 (AppKey, plateforme "ios" != "dev") échoue d'abord — ordre
+        // strict A17-APPKEY-5. Le `sub` du jeton est donc sans importance ici.
+        let principal_id = fixture_principal("valid_hugo");
+        let token = fixture_token("valid_hugo");
         let resp = client
             .get(format!("{base_url}/v1/mailbox/{principal_id}/messages"))
             .header("x-app-key", TEST_APPKEY_RAW)
