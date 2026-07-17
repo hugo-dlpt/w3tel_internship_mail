@@ -668,18 +668,23 @@ async fn deliver_to_recipients(
                 continue;
             }
         };
-        let (summary_ct, summary_key) = match crypto::seal_message(
-            b"[resume non implemente - A08]",
-            &crypto::aad_for_summary(message_id),
-        ) {
-            Ok(v) => v,
-            Err(_) => {
-                obs.events.with_label_values(&["diamy-mxd", "tempfail_crypto_error"]).inc();
-                failed += 1;
-                continue;
-            }
-        };
-        drop(summary_key);
+        // A20-IMAP-2 (Bridge) : le Sujet capturé par le parsing MIME (`parsed.subject`) est
+        // scellé ICI sous le MÊME `message_key` que le corps (AAD distincte, `aad_for_summary` —
+        // "mailsum:" vs "mailblob:") — pas une clé jetable indépendante comme auparavant
+        // (`[resume non implemente - A08]` scellé puis SA clé aussitôt droppée, donc jamais
+        // déchiffrable par personne : un bug latent, corrigé ici en même temps). Ainsi la MÊME
+        // enveloppe par appareil (ci-dessous) suffit à déchiffrer corps ET sujet.
+        let subject_bytes = parsed.subject.as_deref().unwrap_or("").as_bytes();
+        let summary_ct =
+            match crypto::seal_message_with_key(subject_bytes, &message_key, &crypto::aad_for_summary(message_id)) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(recipient_id = %recipient.id, error = %e, "échec du chiffrement du sujet");
+                    obs.events.with_label_values(&["diamy-mxd", "tempfail_crypto_error"]).inc();
+                    failed += 1;
+                    continue;
+                }
+            };
 
         let mut envelopes = Vec::with_capacity(devices.len());
         let mut envelope_error = false;
@@ -824,14 +829,18 @@ async fn hold_recipient(
                 return HoldOutcome::Failed;
             }
         };
-    let (summary_ct, summary_key) = match crypto::seal_message(
-        b"[resume non implemente - A08]",
-        &crypto::aad_for_summary(message_id),
-    ) {
-        Ok(v) => v,
-        Err(_) => return HoldOutcome::Failed,
-    };
-    drop(summary_key);
+    // A20-IMAP-2 (Bridge) : même correctif que la livraison normale (voir `deliver_to_recipients`)
+    // — le Sujet est scellé sous le MÊME `message_key` que le corps, pas sous une clé jetable
+    // aussitôt droppée (l'ancien `summary_ct` n'était donc jamais déchiffrable).
+    let subject_bytes = parsed.subject.as_deref().unwrap_or("").as_bytes();
+    let summary_ct =
+        match crypto::seal_message_with_key(subject_bytes, &message_key, &crypto::aad_for_summary(message_id)) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(%principal_id, error = %e, "échec chiffrement du sujet (hold)");
+                return HoldOutcome::Failed;
+            }
+        };
 
     // Nom de dossier "Inbox" : placeholder HORS MODÈLE A02 (même traitement que la livraison
     // normale — la vraie clé de dossier est côté client, A03-KEY-3).

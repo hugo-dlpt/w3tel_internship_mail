@@ -79,6 +79,20 @@ pub fn open_message(
     backend::open_message(ct, key, aad)
 }
 
+/// Symétrique de [`open_message`] : scelle sous une [`MessageKey`] DÉJÀ existante — contrairement
+/// à [`seal_message`], qui en tire toujours une fraîche. Sert à sceller plusieurs blobs (ex.
+/// corps + résumé) sous le MÊME `k_msg` d'un message, chacun avec sa propre AAD de domaine
+/// ([`aad_for_blob`]/[`aad_for_summary`]) : une seule enveloppe par appareil ([`wrap_key_for_device`])
+/// suffit alors à déchiffrer les deux, l'AAD garantissant qu'un chiffré ne peut pas être permuté
+/// pour un autre (même discipline fail-closed que [`seal_message`], INV-6/7).
+pub fn seal_message_with_key(
+    plaintext: &[u8],
+    key: &MessageKey,
+    aad: &[u8],
+) -> Result<Ciphertext, CryptoError> {
+    backend::seal_message_with_key(plaintext, key, aad)
+}
+
 /// AAD normative d'un blob de corps/pièce jointe (A02-CRY-2) : `"mailblob:" + message_id + ":" + blob_id`.
 ///
 /// UUIDs en forme BINAIRE (16 octets chacun), jamais la représentation texte à tirets
@@ -268,6 +282,27 @@ mod tests {
         let mk2 = unwrap_key(&env, &sk, &env_aad).unwrap();
         let opened = open_message(&ct, &mk2, &aad).unwrap();
         assert_eq!(opened.as_bytes(), plaintext);
+    }
+
+    // Deux blobs (corps + résumé) scellés sous le MÊME k_msg, chacun avec sa propre AAD de
+    // domaine, doivent tous deux s'ouvrir avec cette clé — et rester étanches l'un à l'autre
+    // (l'AAD du corps n'ouvre pas le résumé, et vice versa), fail-closed (INV-8/16).
+    #[test]
+    fn seal_message_with_key_round_trips_and_is_domain_separated_by_aad() {
+        let message_id = uuid::Uuid::now_v7();
+        let blob_id = uuid::Uuid::now_v7();
+        let (body_ct, mk) = seal_message(b"corps du message", &aad_for_blob(message_id, blob_id)).unwrap();
+        let summary_ct =
+            seal_message_with_key(b"Sujet du message", &mk, &aad_for_summary(message_id)).unwrap();
+
+        let opened_body = open_message(&body_ct, &mk, &aad_for_blob(message_id, blob_id)).unwrap();
+        assert_eq!(opened_body.as_bytes(), b"corps du message");
+        let opened_summary = open_message(&summary_ct, &mk, &aad_for_summary(message_id)).unwrap();
+        assert_eq!(opened_summary.as_bytes(), b"Sujet du message");
+
+        // Étanchéité : l'AAD du corps n'ouvre pas le résumé (et inversement).
+        assert!(open_message(&summary_ct, &mk, &aad_for_blob(message_id, blob_id)).is_err());
+        assert!(open_message(&body_ct, &mk, &aad_for_summary(message_id)).is_err());
     }
 
     // Fail-closed : un tag GCM altéré NE doit PAS produire de clair (INV-8/16).

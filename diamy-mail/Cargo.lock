@@ -443,6 +443,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "diamy-bridged"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "diamy-addr",
+ "diamy-mail-crypto",
+ "diamy-mail-iam",
+ "diamy-obs",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "diamy-mail-crypto"
 version = "0.0.1"
 dependencies = [

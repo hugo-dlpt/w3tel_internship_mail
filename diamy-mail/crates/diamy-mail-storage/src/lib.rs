@@ -275,6 +275,9 @@ pub struct FetchedForDevice {
     /// puisque l'AAD ne correspond plus à celle du scellement.
     pub body_blob_id: Uuid,
     pub body_ct: Ciphertext,
+    /// Sujet scellé (A20-IMAP-2, Bridge) : sous le MÊME `k_msg` que `body_ct`, AAD distincte
+    /// (`crypto::aad_for_summary(message_id)`) — la même enveloppe désemballe les deux.
+    pub summary_ct: Ciphertext,
     pub envelope: Envelope,
 }
 
@@ -293,8 +296,13 @@ pub async fn fetch_message_for_device(
     message_id: Uuid,
     device_id: Uuid,
 ) -> Result<FetchedForDevice, StorageError> {
-    let blob_row = sqlx::query_as::<_, (Uuid, String, Vec<u8>, i32)>(
-        "SELECT b.blob_id, b.object_key, b.nonce, b.blob_alg_version
+    // A20-IMAP-2 (Bridge) : `m.summary_ct`/`m.summary_nonce`/`m.blob_alg_version` (le sujet
+    // scellé, colonnes déjà présentes en base — voir `insert_message_and_body`) sont lus ICI en
+    // plus du blob de corps, via la MÊME jointure déjà nécessaire à la vérification de
+    // propriétaire — pas de requête supplémentaire.
+    let blob_row = sqlx::query_as::<_, (Uuid, String, Vec<u8>, i32, Vec<u8>, Vec<u8>, i32)>(
+        "SELECT b.blob_id, b.object_key, b.nonce, b.blob_alg_version,
+                m.summary_ct, m.summary_nonce, m.blob_alg_version
          FROM mail.blobs b
          JOIN mail.messages m ON m.message_id = b.message_id
          WHERE b.message_id = $1 AND b.kind = 'body' AND m.principal_id = $2
@@ -306,7 +314,15 @@ pub async fn fetch_message_for_device(
     .await?
     .ok_or(StorageError::MessageNotFound(message_id))?;
 
-    let (body_blob_id, object_key, nonce, body_alg_version) = blob_row;
+    let (
+        body_blob_id,
+        object_key,
+        nonce,
+        body_alg_version,
+        summary_ct_bytes,
+        summary_nonce,
+        summary_alg_version,
+    ) = blob_row;
     let body_bytes = blob_store.read(&object_key)?;
     let body_ct = Ciphertext {
         // INV-7 / A02-CRY-7 : la version lue en base est contrôlée ICI (fail-closed sur
@@ -315,6 +331,11 @@ pub async fn fetch_message_for_device(
         alg_version: AlgVersion::from_i32(body_alg_version)?,
         nonce: nonce_from_vec(&nonce)?,
         bytes: body_bytes,
+    };
+    let summary_ct = Ciphertext {
+        alg_version: AlgVersion::from_i32(summary_alg_version)?,
+        nonce: nonce_from_vec(&summary_nonce)?,
+        bytes: summary_ct_bytes,
     };
 
     let env_row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Vec<u8>, i32)>(
@@ -343,6 +364,7 @@ pub async fn fetch_message_for_device(
     Ok(FetchedForDevice {
         body_blob_id,
         body_ct,
+        summary_ct,
         envelope,
     })
 }

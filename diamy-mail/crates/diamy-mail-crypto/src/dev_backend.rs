@@ -91,6 +91,19 @@ pub fn open_message(
     }
 }
 
+/// Symétrique de [`open_message`] : scelle sous une `MessageKey` DÉJÀ existante (contrairement
+/// à `seal_message`, qui en tire toujours une fraîche). Permet de sceller plusieurs blobs
+/// (corps + résumé) sous le MÊME `k_msg`, chacun avec sa propre AAD de domaine
+/// (`aad_for_blob`/`aad_for_summary`) — même clé, séparation par AAD, comme prévu par le design.
+pub fn seal_message_with_key(
+    plaintext: &[u8],
+    key: &MessageKey,
+    aad: &[u8],
+) -> Result<Ciphertext, CryptoError> {
+    let (nonce, bytes) = aes_encrypt(key.as_bytes(), plaintext, aad)?;
+    Ok(Ciphertext { alg_version: AlgVersion::CURRENT, nonce, bytes })
+}
+
 pub fn generate_device_keypair() -> Result<(DeviceEncPublicKey, DeviceEncSecretKey), CryptoError> {
     let mut rng = OsRng;
     let (dk, ek) = MlKem768::generate(&mut rng);

@@ -66,6 +66,13 @@ pub struct ParsedMessage {
     /// pipeline). Voir [`BodySource`] pour l'ordre de préférence.
     pub body: Vec<u8>,
     pub body_source: BodySource,
+    /// Sujet décodé (RFC 2047 assuré par `mail-parser`), destiné à devenir LUI AUSSI du
+    /// CIPHERTEXT (jamais stocké en clair côté serveur, comme le corps — voir
+    /// `diamy-mxd::deliver_to_recipients`/`hold_recipient`, qui le scellent sous le même
+    /// `k_msg` que le corps). `None` si le parsing a échoué entièrement (repli brut,
+    /// [`BodySource::RawFallback`] sans message analysable) — aucun en-tête n'est alors
+    /// disponible, pas seulement le sujet.
+    pub subject: Option<String>,
     /// A01 §9 : le parsing MIME/RFC 5322 a échoué ou a dépassé une borne —
     /// jamais un rejet du message pour ce seul motif (A01-STAB-2/A08-TXT-2
     /// esprit : on dégrade, on ne perd jamais silencieusement).
@@ -83,19 +90,21 @@ pub struct ParsedMessage {
 /// c'est un service exposé à Internet, l'entrée est par définition hostile.
 pub fn parse_inbound_message(raw: &[u8]) -> ParsedMessage {
     let Some(message) = MessageParser::default().parse(raw) else {
-        return raw_fallback(raw, true, 0);
+        return raw_fallback(raw, true, 0, None);
     };
 
     if message.parts.len() > MAX_PARTS {
-        return raw_fallback(raw, true, message.attachments.len());
+        return raw_fallback(raw, true, message.attachments.len(), None);
     }
 
     let attachments_seen = message.attachments.len();
+    let subject = message.subject().map(str::to_string);
 
     if let Some((body, charset_recovered)) = first_genuine_text(&message, &message.text_body) {
         return ParsedMessage {
             body,
             body_source: BodySource::PlainText,
+            subject,
             malformed: false,
             charset_recovered,
             attachments_seen,
@@ -105,19 +114,21 @@ pub fn parse_inbound_message(raw: &[u8]) -> ParsedMessage {
         return ParsedMessage {
             body,
             body_source: BodySource::HtmlSource,
+            subject,
             malformed: false,
             charset_recovered,
             attachments_seen,
         };
     }
 
-    raw_fallback(raw, false, attachments_seen)
+    raw_fallback(raw, false, attachments_seen, subject)
 }
 
-fn raw_fallback(raw: &[u8], malformed: bool, attachments_seen: usize) -> ParsedMessage {
+fn raw_fallback(raw: &[u8], malformed: bool, attachments_seen: usize, subject: Option<String>) -> ParsedMessage {
     ParsedMessage {
         body: raw.to_vec(),
         body_source: BodySource::RawFallback,
+        subject,
         malformed,
         charset_recovered: false,
         attachments_seen,
@@ -157,6 +168,26 @@ mod tests {
         let body = String::from_utf8(parsed.body).unwrap();
         assert!(body.contains("Corps du message."));
         assert!(!body.contains("Subject:"), "les en-têtes ne doivent pas fuiter dans le corps sélectionné");
+    }
+
+    #[test]
+    fn subject_is_extracted_and_rfc2047_decoded() {
+        let raw = b"From: sender@example.org\r\nTo: hugo@w3.tel\r\nSubject: Bonjour\r\n\r\nCorps.\r\n";
+        let parsed = parse_inbound_message(raw);
+        assert_eq!(parsed.subject.as_deref(), Some("Bonjour"));
+
+        // RFC 2047 encoded-word (ex. accents) doit être décodé par mail-parser.
+        let raw_encoded =
+            b"From: sender@example.org\r\nTo: hugo@w3.tel\r\nSubject: =?UTF-8?B?UsOpdW5pb24gw6AgMTRo?=\r\n\r\nCorps.\r\n";
+        let parsed_encoded = parse_inbound_message(raw_encoded);
+        assert_eq!(parsed_encoded.subject.as_deref(), Some("Réunion à 14h"));
+    }
+
+    #[test]
+    fn missing_subject_header_yields_none() {
+        let raw = b"From: sender@example.org\r\nTo: hugo@w3.tel\r\n\r\nCorps sans sujet.\r\n";
+        let parsed = parse_inbound_message(raw);
+        assert_eq!(parsed.subject, None);
     }
 
     #[test]

@@ -60,11 +60,24 @@ async fn list_messages(
     // N'IMPORTE QUEL principal suffirait à lister la boîte de N'IMPORTE QUEL autre
     // (A04-EP-3, INV-25). Pas de fuite d'existence (A04-ERR-1) : 404 générique.
     if identity.principal_id != principal_id {
+        tracing::debug!(
+            token_principal_id = %identity.principal_id,
+            requested_principal_id = %principal_id,
+            "SELECT/list_messages : principal du jeton != principal de l'URL, rejet 404"
+        );
         return Err((StatusCode::NOT_FOUND, "introuvable".to_string()));
     }
     let messages = storage::list_recent_messages(&state.pool, principal_id, 50)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Diagnostic SELECT (0 EXISTS inattendu côté Bridge) : le principal effectivement
+    // interrogé et le nombre de lignes trouvées en base — visible avec
+    // RUST_LOG=diamy_maild=debug.
+    tracing::debug!(
+        %principal_id,
+        messages_found = messages.len(),
+        "SELECT/list_messages : catalogue interrogé"
+    );
     Ok(Json(
         messages
             .into_iter()
@@ -96,6 +109,11 @@ struct FetchedDto {
     body_alg_version: i32,
     body_nonce_b64: String,
     body_ciphertext_b64: String,
+    /// Sujet scellé (A20-IMAP-2, Bridge) : sous le MÊME `k_msg` que le corps, AAD distincte
+    /// (`aad_for_summary(message_id)`) — l'enveloppe ci-dessous désemballe les deux.
+    summary_alg_version: i32,
+    summary_nonce_b64: String,
+    summary_ciphertext_b64: String,
     envelope_alg_version: i32,
     envelope_kem_ct_b64: String,
     envelope_wrap_nonce_b64: String,
@@ -134,6 +152,9 @@ async fn fetch_message(
         body_alg_version: fetched.body_ct.alg_version.as_i32(),
         body_nonce_b64: STANDARD.encode(fetched.body_ct.nonce),
         body_ciphertext_b64: STANDARD.encode(&fetched.body_ct.bytes),
+        summary_alg_version: fetched.summary_ct.alg_version.as_i32(),
+        summary_nonce_b64: STANDARD.encode(fetched.summary_ct.nonce),
+        summary_ciphertext_b64: STANDARD.encode(&fetched.summary_ct.bytes),
         envelope_alg_version: fetched.envelope.wrapped.alg_version.as_i32(),
         envelope_kem_ct_b64: STANDARD.encode(&fetched.envelope.kem_ct),
         envelope_wrap_nonce_b64: STANDARD.encode(fetched.envelope.wrapped.nonce),

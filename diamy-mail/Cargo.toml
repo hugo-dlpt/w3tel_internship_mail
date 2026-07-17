@@ -12,6 +12,7 @@ members = [
   "services/diamy-mxd",
   "services/diamy-maild",
   "services/diamy-submitd",
+  "services/diamy-bridged",
   # "services/diamy-cald",   # active-le quand tu attaques l'agenda (A12-A15)
 ]
 

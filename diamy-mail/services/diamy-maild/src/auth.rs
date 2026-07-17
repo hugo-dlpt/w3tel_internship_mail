@@ -63,19 +63,32 @@ pub struct AppKeyStore {
 }
 
 impl AppKeyStore {
-    /// Doublure de DEV (voir `SIMPLIFICATIONS.md`) : amorce UNE AppKey Tier 2 lue depuis
-    /// `DIAMY_MAILD_DEV_APPKEY` (valeur de dev par défaut sinon, même discipline que le
-    /// mot de passe Postgres de ce projet). Un vrai déploiement gère un cycle de vie
-    /// complet (création/rotation/révocation par plateforme, A17-APPKEY-1/7) — hors
-    /// périmètre de cette maquette à tranche unique.
+    /// Doublure de DEV (voir `SIMPLIFICATIONS.md`) : amorce DEUX AppKeys Tier 2 —
+    /// `DIAMY_MAILD_DEV_APPKEY` (client natif de test, `diamy-mail-dev-client`) et
+    /// `DIAMY_MAILD_DEV_BRIDGE_APPKEY` (Bridge, `diamy-mail-bridge`). Deux entrées DISTINCTES,
+    /// jamais partagées : le Bridge est son propre appareil enrôlé (A20-CRED-4b) et DOIT donc
+    /// avoir sa propre AppKey Tier 2, distincte de celle du client co-localisé (A20-CRED-5) —
+    /// révoquer l'une n'affecte pas l'autre. Un vrai déploiement gère un cycle de vie complet
+    /// (création/rotation/révocation par plateforme, A17-APPKEY-1/7) — hors périmètre de cette
+    /// maquette à tranche unique.
     pub fn seeded_from_env() -> Self {
         let raw = std::env::var("DIAMY_MAILD_DEV_APPKEY")
             .unwrap_or_else(|_| "devonly_change_me_appkey_dev_client".to_string());
+        let bridge_raw = std::env::var("DIAMY_MAILD_DEV_BRIDGE_APPKEY")
+            .unwrap_or_else(|_| "devonly_change_me_appkey_bridge_dev_client".to_string());
         let mut by_hash = HashMap::new();
         by_hash.insert(
             hash_key(raw.as_bytes()),
             AppKeyRecord {
                 app_name: "diamy-mail-dev-client".to_string(),
+                app_platform: "dev".to_string(),
+                active: true,
+            },
+        );
+        by_hash.insert(
+            hash_key(bridge_raw.as_bytes()),
+            AppKeyRecord {
+                app_name: "diamy-mail-bridge".to_string(),
                 app_platform: "dev".to_string(),
                 active: true,
             },
@@ -225,5 +238,23 @@ mod tests {
     fn missing_appkey_headers_are_rejected() {
         let store = AppKeyStore::seeded_from_env();
         assert!(!check_app_key(&HeaderMap::new(), &store));
+    }
+
+    // A20-CRED-5 : le Bridge a sa PROPRE AppKey, distincte de celle du client de test natif —
+    // les deux fonctionnent indépendamment, et l'une n'authentifie jamais sous le nom de l'autre.
+    #[test]
+    fn bridge_appkey_is_distinct_from_native_client_appkey() {
+        let store = AppKeyStore::seeded_from_env();
+        let native_raw = std::env::var("DIAMY_MAILD_DEV_APPKEY")
+            .unwrap_or_else(|_| "devonly_change_me_appkey_dev_client".to_string());
+        let bridge_raw = std::env::var("DIAMY_MAILD_DEV_BRIDGE_APPKEY")
+            .unwrap_or_else(|_| "devonly_change_me_appkey_bridge_dev_client".to_string());
+
+        assert!(check_app_key(&headers_with(&native_raw, "diamy-mail-dev-client", "dev", "0.0.1"), &store));
+        assert!(check_app_key(&headers_with(&bridge_raw, "diamy-mail-bridge", "dev", "0.0.1"), &store));
+
+        // La clé du Bridge ne doit PAS authentifier sous le nom du client natif, ni l'inverse.
+        assert!(!check_app_key(&headers_with(&bridge_raw, "diamy-mail-dev-client", "dev", "0.0.1"), &store));
+        assert!(!check_app_key(&headers_with(&native_raw, "diamy-mail-bridge", "dev", "0.0.1"), &store));
     }
 }
