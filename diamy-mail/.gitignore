@@ -23,3 +23,9 @@ Cargo.lock.orig
 # Local à la machine de dev ; un vrai déploiement l'envoie à un sink d'audit durable.
 /audit_log/
 **/audit_log/
+
+# État d'UID IMAP persisté du Bridge (Point 2 — correction de l'instabilité d'UID). Table de
+# correspondance message_id→UID stable, PAR principal/mailbox. Local à la machine (notion propre
+# au protocole IMAP, pas une donnée métier du serveur mail) — recréée au besoin.
+/bridge_state/
+/services/diamy-bridged/bridge_state/

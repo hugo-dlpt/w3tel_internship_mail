@@ -47,9 +47,12 @@ const MAX_LITERAL_LEN: usize = MAX_LINE_LEN;
 /// continuation, pas seulement la taille (INV-15 : un client ne doit jamais pouvoir garder la
 /// session en attente de littéral indéfiniment).
 const MAX_LITERALS_PER_COMMAND: usize = 8;
-/// UIDVALIDITY fixe (V1 démo, pas de stockage persistant d'UID côté Bridge) — voir
-/// `SIMPLIFICATIONS.md` : un vrai Bridge devrait la garder stable entre sessions.
-const UID_VALIDITY: u32 = 1;
+/// Répertoire par défaut de l'état d'UID IMAP persisté (Point 2 — correction de l'instabilité
+/// d'UID). Overridable par `DIAMY_BRIDGED_UID_STATE_DIR`. Chemin relatif au cwd, MÊME convention
+/// que `./dev_secrets` / `./blob_store`. C'est une notion PROPRE au protocole IMAP (RFC 3501),
+/// pas une donnée métier du serveur mail : elle vit donc côté Bridge, jamais côté `diamy-maild`
+/// (voir la justification d'architecture dans `SIMPLIFICATIONS.md`).
+const DEFAULT_UID_STATE_DIR: &str = "./bridge_state";
 /// Borne défensive (esprit A01-STAB-1 / INV-15) sur un corps SMTP `DATA` — même valeur par
 /// défaut que `diamy-mxd::DEFAULT_MAX_DATA_BYTES`.
 const MAX_SMTP_DATA_BYTES: usize = 10 * 1024 * 1024;
@@ -67,6 +70,12 @@ struct BridgeConfig {
     /// URL de `POST /submit` sur `diamy-submitd` (A20-SMTP-1 : le Bridge ne relaie JAMAIS
     /// lui-même vers Internet — il délègue au chemin sortant natif, A10).
     submit_url: String,
+    /// Domaines locaux connus du Bridge — MIROIR de `DIAMY_SUBMITD_LOCAL_DOMAINS` côté
+    /// `diamy-submitd` (défaut `w3.tel`). Sert à rejeter un destinataire externe DÈS le `RCPT TO`
+    /// (RFC 5321 : rejeter au plus tôt quand on sait que le destinataire ne sera jamais accepté),
+    /// plutôt que d'accepter la commande puis découvrir le rejet après le `DATA` (mauvaise UX
+    /// côté client : "Envoi..." bloqué). Comparaison insensible à la casse, sans le `.` de tête.
+    local_domains: Vec<String>,
 }
 
 impl BridgeConfig {
@@ -103,7 +112,21 @@ impl BridgeConfig {
                 .unwrap_or_else(|_| "devonly_change_me_appkey_bridge_dev_client".to_string()),
             submit_url: std::env::var("DIAMY_SUBMITD_SUBMIT_URL")
                 .unwrap_or_else(|_| "https://127.0.0.1:8446/submit".to_string()),
+            local_domains: std::env::var("DIAMY_BRIDGED_LOCAL_DOMAINS")
+                .unwrap_or_else(|_| "w3.tel".to_string())
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
         })
+    }
+
+    /// Un destinataire de ce domaine est-il relayable en boucle fermée (local) ? Si NON, le
+    /// Bridge le rejette dès le `RCPT TO` — le relais externe est désactivé en maquette (décision
+    /// de Cédric ; voir `diamy-submitd`). Même règle de comparaison que `SubmitdConfig`.
+    fn is_local_domain(&self, domain: &str) -> bool {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        self.local_domains.iter().any(|d| d == &domain)
     }
 }
 
@@ -242,6 +265,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .danger_accept_invalid_certs(true)
         .build()?;
 
+    // Point 2 : registre d'UID stables PERSISTÉS, partagé par toutes les connexions IMAP. Vit
+    // côté Bridge (notion propre au protocole IMAP), sous `bridge_state/` par défaut.
+    let uid_state_dir = std::env::var("DIAMY_BRIDGED_UID_STATE_DIR")
+        .unwrap_or_else(|_| DEFAULT_UID_STATE_DIR.to_string());
+    let uid_registry = Arc::new(UidRegistry::new(PathBuf::from(uid_state_dir)));
+
     // A20-SMTP-1 : écoute SMTP locale du Bridge, MÊME discipline loopback-only que l'IMAP
     // ci-dessus (A20-ARCH-2/NET-1/2) — bind puis re-vérification fail-closed AVANT de servir.
     let smtp_listener = TcpListener::bind(config.smtp_bind_addr).await?;
@@ -305,9 +334,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         obs.events.with_label_values(&["diamy-bridged", "session_started"]).inc();
         let config = config.clone();
         let http = http.clone();
+        let uid_registry = uid_registry.clone();
         let obs = obs.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, config, http, obs).await {
+            if let Err(e) = handle_connection(socket, config, http, uid_registry, obs).await {
                 tracing::warn!(%peer, error = %e, "session IMAP interrompue");
             }
         });
@@ -324,11 +354,13 @@ struct AuthedSession {
     mail_plane_token: String,
 }
 
-/// Boîte "INBOX" sélectionnée : instantané du catalogue au moment du SELECT, avec des UID de
-/// SESSION (1..N, ordre chronologique croissant) — pas de persistance entre sessions (V1
-/// démo, lecture seule, voir `SIMPLIFICATIONS.md`).
+/// Boîte "INBOX" sélectionnée : instantané du catalogue au moment du SELECT, avec des UID
+/// STABLES et PERSISTÉS (Point 2 — plus des positions 1..N recalculées à chaque fetch). Chaque
+/// UID vient de `UidRegistry` et ne bouge JAMAIS de la vie du message ; le Vec est trié par UID
+/// croissant (== ordre chronologique d'arrivée), donc le numéro de séquence IMAP (position 1..N
+/// dans ce Vec) reste cohérent avec l'ordre des UID (RFC 3501 : UID strictement croissants).
 struct SelectedMailbox {
-    messages: Vec<(u32, MessageSummaryDto)>, // (uid, résumé)
+    messages: Vec<(u32, MessageSummaryDto)>, // (uid stable, résumé)
 }
 
 struct Session {
@@ -336,10 +368,189 @@ struct Session {
     mailbox: Option<SelectedMailbox>,
 }
 
+/// Vue d'une boîte fraîchement tirée du catalogue de `diamy-maild`, avec ses UID stables
+/// résolus. Portée par `fetch_mailbox_catalog` vers `cmd_select`/`cmd_status`/`cmd_noop`.
+struct MailboxView {
+    /// RFC 3501 §2.3.1.1 — constante tant que les UID sont stables (voir `MailboxUidState`).
+    uid_validity: u32,
+    /// UID qui sera attribué au PROCHAIN nouveau message (`UIDNEXT`) — jamais `count + 1`, car
+    /// un EXPUNGE laisse des trous : `uid_next` reste strictement au-dessus de tout UID déjà vu.
+    uid_next: u32,
+    messages: Vec<(u32, MessageSummaryDto)>, // (uid stable, résumé), trié par UID croissant
+}
+
+// ============================ Point 2 : UID stables et persistés =============================
+//
+// **Constat de l'audit** : les UID étaient POSITIONNELS (position 1..N recalculée à chaque
+// `fetch_mailbox_catalog`), alors qu'`UIDVALIDITY` restait fixe = 1. C'est contradictoire avec
+// la RFC 3501 §2.3.1.1 : une `UIDVALIDITY` constante PROMET des UID stables qu'un vrai client
+// peut mettre en cache entre sessions. Scénario de bug : après un EXPUNGE retirant un message du
+// milieu, les suivants glissaient, et un nouveau message pouvait hériter de l'UID qu'un client
+// avait mis en cache pour un AUTRE message — une action ultérieure aurait touché le mauvais.
+//
+// **Correction (option a de l'audit)** : une table de correspondance PERSISTÉE `message_id`
+// (identité stable, déjà utilisée partout) → UID IMAP stable, par principal/mailbox, avec un
+// compteur `uid_next` STRICTEMENT croissant (un UID libéré n'est JAMAIS réattribué). C'est une
+// notion propre au protocole IMAP (RFC 3501), pas une donnée métier zéro-accès du serveur : elle
+// vit donc côté Bridge (fichier local sous `bridge_state/`), jamais dans `diamy-maild` — ce qui
+// serait polluer le catalogue métier d'un artefact protocolaire (A20-IMAP-1 : le Bridge PRÉSENTE
+// les messages comme de l'IMAP standard, c'est lui la couche protocole ; A04 identifie les
+// messages par `message_id`, jamais par un UID IMAP).
+
+/// État d'UID stable et persisté pour une (principal, mailbox=INBOX).
+#[derive(Serialize, Deserialize, Clone)]
+struct MailboxUidState {
+    /// Fixée à la création de l'état (timestamp Unix). Bumpée UNIQUEMENT si l'état persisté est
+    /// corrompu/absent/incohérent au chargement (secours : force un client à jeter son cache
+    /// plutôt qu'à risquer une mauvaise correspondance). Stable sinon (RFC 3501 §2.3.1.1).
+    uid_validity: u32,
+    /// Prochain UID à attribuer — strictement croissant, JAMAIS décrémenté ni réutilisé.
+    uid_next: u32,
+    /// `message_id` → UID stable. Une entrée y RESTE même après purge (tombstone) : `uid_next`
+    /// garantit déjà la non-réutilisation, et conserver l'entrée évite toute réattribution si un
+    /// catalogue transitoirement incomplet réapparaissait.
+    entries: std::collections::HashMap<Uuid, u32>,
+}
+
+impl MailboxUidState {
+    /// Nouvel état frais : `uid_validity` = timestamp (monotone entre démarrages, donc
+    /// strictement supérieur à tout état antérieur → un client jette bien son cache), compteur
+    /// à 1, aucune correspondance.
+    fn fresh() -> Self {
+        Self { uid_validity: UidRegistry::fresh_validity(), uid_next: 1, entries: std::collections::HashMap::new() }
+    }
+}
+
+/// Gère l'état d'UID persisté, PARTAGÉ entre toutes les connexions IMAP du process (un client
+/// tiers peut ouvrir plusieurs connexions). Écrit-au-travers sur disque à chaque nouvel UID
+/// attribué : c'est cette persistance CROSS-SESSION qui rend les UID vraiment stables (RFC
+/// 3501), pas seulement le temps d'une connexion.
+struct UidRegistry {
+    dir: PathBuf,
+    cache: tokio::sync::Mutex<std::collections::HashMap<Uuid, MailboxUidState>>,
+}
+
+impl UidRegistry {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir, cache: tokio::sync::Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    fn state_path(&self, principal_id: Uuid) -> PathBuf {
+        self.dir.join(format!("{principal_id}.INBOX.uidmap.json"))
+    }
+
+    /// `UIDVALIDITY` de secours : secondes Unix (u32). Monotone d'un démarrage à l'autre — un
+    /// état recréé (fichier absent/corrompu) reçoit ainsi une validity STRICTEMENT supérieure à
+    /// tout état antérieur, ce qui force un client à invalider son cache (RFC 3501 §2.3.1.1).
+    fn fresh_validity() -> u32 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// Vérifie la cohérence interne d'un état chargé — un état incohérent est traité comme
+    /// corrompu (bump de secours) plutôt que servi tel quel (fail-safe).
+    fn is_coherent(state: &MailboxUidState) -> bool {
+        if state.uid_validity == 0 || state.uid_next < 1 {
+            return false;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for &uid in state.entries.values() {
+            // Tout UID attribué doit être dans [1, uid_next) et unique.
+            if uid < 1 || uid >= state.uid_next || !seen.insert(uid) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Charge l'état depuis le disque, ou en crée un frais (validity bumpée) si le fichier est
+    /// absent, illisible, non parsable, ou incohérent — en cas de doute, on préfère forcer un
+    /// cache-drop client à risquer une mauvaise correspondance d'UID.
+    fn load_or_fresh(&self, principal_id: Uuid) -> MailboxUidState {
+        let path = self.state_path(principal_id);
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<MailboxUidState>(&bytes) {
+                Ok(state) if Self::is_coherent(&state) => state,
+                Ok(_) => {
+                    tracing::warn!(%principal_id, "état d'UID INCOHÉRENT — bump UIDVALIDITY (secours, RFC 3501)");
+                    MailboxUidState::fresh()
+                }
+                Err(e) => {
+                    tracing::warn!(%principal_id, error = %e, "état d'UID CORROMPU — bump UIDVALIDITY (secours)");
+                    MailboxUidState::fresh()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => MailboxUidState::fresh(),
+            Err(e) => {
+                tracing::warn!(%principal_id, error = %e, "lecture état d'UID échouée — bump UIDVALIDITY (secours)");
+                MailboxUidState::fresh()
+            }
+        }
+    }
+
+    /// Écrit l'état sur disque (best-effort : un échec est loggué mais n'interrompt pas la
+    /// session — un UID non persisté redeviendra simplement "nouveau" au prochain démarrage, ce
+    /// que le bump d'`UIDVALIDITY` couvre déjà côté client).
+    fn persist(&self, principal_id: Uuid, state: &MailboxUidState) {
+        let path = self.state_path(principal_id);
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(%principal_id, error = %e, "création du répertoire d'état d'UID échouée");
+                return;
+            }
+        }
+        match serde_json::to_vec_pretty(state) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(&path, &bytes) {
+                    tracing::warn!(%principal_id, error = %e, "persistance de l'état d'UID échouée");
+                }
+            }
+            Err(e) => tracing::warn!(%principal_id, error = %e, "sérialisation de l'état d'UID échouée"),
+        }
+    }
+
+    /// Résout les UID stables des `message_ids` reçus DANS L'ORDRE (chronologique ascendant : le
+    /// plus ancien nouveau message reçoit le plus petit nouvel UID). Attribue un UID neuf
+    /// (`uid_next`, puis incrémenté) à chaque `message_id` inconnu, réutilise l'UID mémorisé
+    /// pour les autres — jamais une position recalculée. Persiste si de nouveaux UID sont créés.
+    /// Retourne `(uid_validity, uid_next, uids alignés à message_ids)`.
+    async fn resolve(&self, principal_id: Uuid, message_ids: &[Uuid]) -> (u32, u32, Vec<u32>) {
+        let mut cache = self.cache.lock().await;
+        let state = cache
+            .entry(principal_id)
+            .or_insert_with(|| self.load_or_fresh(principal_id));
+
+        let mut changed = false;
+        let mut uids = Vec::with_capacity(message_ids.len());
+        for &mid in message_ids {
+            let uid = match state.entries.get(&mid) {
+                Some(&u) => u,
+                None => {
+                    let u = state.uid_next;
+                    // Strictement croissant, jamais réutilisé — même après purge d'anciens UID.
+                    state.uid_next = state.uid_next.saturating_add(1);
+                    state.entries.insert(mid, u);
+                    changed = true;
+                    u
+                }
+            };
+            uids.push(uid);
+        }
+        if changed {
+            self.persist(principal_id, state);
+        }
+        (state.uid_validity, state.uid_next, uids)
+    }
+}
+
 async fn handle_connection(
     socket: TcpStream,
     config: Arc<BridgeConfig>,
     http: reqwest::Client,
+    uid_registry: Arc<UidRegistry>,
     obs: Arc<diamy_obs::Obs>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(socket);
@@ -399,7 +610,7 @@ async fn handle_connection(
                 // Thunderbird. `tokenize_args` (déjà utilisé par LOGIN) gère les deux formes.
                 let mailbox = tokenize_args(args).into_iter().next().unwrap_or_default();
                 if mailbox.eq_ignore_ascii_case("INBOX") {
-                    cmd_select(&mut reader, &config, &http, &mut session, &tag).await?
+                    cmd_select(&mut reader, &config, &http, &uid_registry, &mut session, &tag).await?
                 } else {
                     format!("{tag} NO seule INBOX existe (V1 démo)\r\n")
                 }
@@ -420,10 +631,10 @@ async fn handle_connection(
                 }
             }
             "NOOP" => {
-                cmd_noop(&mut reader, &config, &http, &mut session).await?;
+                cmd_noop(&mut reader, &config, &http, &uid_registry, &mut session).await?;
                 String::new()
             }
-            "STATUS" => cmd_status(&mut reader, &config, &http, &session, &tag, args).await?,
+            "STATUS" => cmd_status(&mut reader, &config, &http, &uid_registry, &session, &tag, args).await?,
             "CLOSE" => String::new(),
             "LOGOUT" => {
                 reader.get_mut().write_all(b"* BYE diamy-bridged fermeture\r\n").await?;
@@ -552,19 +763,21 @@ fn auth_headers(builder: reqwest::RequestBuilder, config: &BridgeConfig, token: 
         .header("authorization", format!("Bearer {token}"))
 }
 
-/// Interroge FRAÎCHEMENT diamy-maild et reconstruit la liste NUMÉROTÉE (ordre chronologique
-/// ascendant, UID = position 1..N) — appelée à CHAQUE SELECT/STATUS/NOOP, JAMAIS mise en cache
-/// d'une commande à l'autre. C'est cette re-interrogation systématique qui garantit qu'un mail
-/// arrivé pendant que la connexion IMAP reste ouverte est vu à la prochaine commande, sans
-/// avoir à fermer/rouvrir la session. `context` identifie l'appelant dans les logs debug
-/// (visible avec RUST_LOG=diamy_bridged=debug) pour voir, commande par commande, si le compte
-/// reste bloqué ou progresse bien.
+/// Interroge FRAÎCHEMENT diamy-maild et reconstruit la liste des messages avec leurs UID
+/// STABLES (Point 2 — plus une position 1..N recalculée) — appelée à CHAQUE SELECT/STATUS/NOOP,
+/// JAMAIS mise en cache d'une commande à l'autre. C'est cette re-interrogation systématique qui
+/// garantit qu'un mail arrivé pendant que la connexion IMAP reste ouverte est vu à la prochaine
+/// commande, sans avoir à fermer/rouvrir la session. `context` identifie l'appelant dans les
+/// logs debug (visible avec RUST_LOG=diamy_bridged=debug). Les UID viennent du `UidRegistry`
+/// persisté : un message garde son UID toute sa vie, un nouveau message reçoit un UID neuf
+/// jamais réutilisé.
 async fn fetch_mailbox_catalog(
     config: &BridgeConfig,
     http: &reqwest::Client,
+    uid_registry: &UidRegistry,
     authed: &AuthedSession,
     context: &str,
-) -> Result<Vec<(u32, MessageSummaryDto)>, String> {
+) -> Result<MailboxView, String> {
     let list_url = format!("{}/v1/mailbox/{}/messages", config.sync_base, authed.principal.id);
     tracing::debug!(
         %context,
@@ -592,19 +805,32 @@ async fn fetch_mailbox_catalog(
         "nombre de messages reçus du catalogue (avant EXISTS/STATUS)"
     );
 
-    // Le catalogue serveur est trié DESC par `received_at` (`list_recent_messages`) — IMAP
-    // veut l'UID croissant en ordre chronologique (le plus ancien = UID 1) : on inverse. Les
-    // messages déjà vus gardent le même UID d'une commande à l'autre (les nouveaux arrivent
-    // forcément plus tard chronologiquement, donc s'ajoutent à la fin avec un UID plus grand).
+    // Le catalogue serveur est trié DESC par `received_at` (`list_recent_messages`) — on inverse
+    // pour obtenir l'ordre chronologique ASCENDANT : c'est cet ordre qui détermine l'attribution
+    // des NOUVEAUX UID (le plus ancien nouveau message reçoit le plus petit nouvel UID). Les
+    // messages déjà connus, eux, gardent l'UID mémorisé quelle que soit leur position.
     let mut ascending = messages;
     ascending.reverse();
-    Ok(ascending.into_iter().enumerate().map(|(i, m)| ((i as u32) + 1, m)).collect())
+
+    // Résolution des UID STABLES via le registre persisté (Point 2). Un message déjà vu garde
+    // EXACTEMENT son UID ; un nouveau message reçoit `uid_next`, jamais une position recalculée.
+    let message_ids: Vec<Uuid> = ascending.iter().map(|m| m.message_id).collect();
+    let (uid_validity, uid_next, uids) = uid_registry.resolve(authed.principal.id, &message_ids).await;
+
+    // Trie par UID croissant : le numéro de séquence IMAP (position 1..N dans ce Vec) doit
+    // rester cohérent avec l'ordre des UID (RFC 3501 : UID strictement croissants avec la
+    // séquence). L'ordre chronologique le garantit déjà en pratique, mais on n'en dépend pas.
+    let mut numbered: Vec<(u32, MessageSummaryDto)> = uids.into_iter().zip(ascending).collect();
+    numbered.sort_by_key(|(uid, _)| *uid);
+
+    Ok(MailboxView { uid_validity, uid_next, messages: numbered })
 }
 
 async fn cmd_select<S>(
     reader: &mut BufReader<S>,
     config: &BridgeConfig,
     http: &reqwest::Client,
+    uid_registry: &UidRegistry,
     session: &mut Session,
     tag: &str,
 ) -> std::io::Result<String>
@@ -615,12 +841,13 @@ where
         return Ok(format!("{tag} NO not authenticated\r\n"));
     };
 
-    let numbered = match fetch_mailbox_catalog(config, http, authed, "SELECT").await {
-        Ok(n) => n,
+    let view = match fetch_mailbox_catalog(config, http, uid_registry, authed, "SELECT").await {
+        Ok(v) => v,
         Err(e) => return Ok(format!("{tag} NO {e}\r\n")),
     };
-    let count = numbered.len() as u32;
-    session.mailbox = Some(SelectedMailbox { messages: numbered });
+    let count = view.messages.len() as u32;
+    let (uid_validity, uid_next) = (view.uid_validity, view.uid_next);
+    session.mailbox = Some(SelectedMailbox { messages: view.messages });
 
     write_logged(reader, &format!("* {count} EXISTS\r\n")).await?;
     write_logged(reader, "* 0 RECENT\r\n").await?;
@@ -628,8 +855,10 @@ where
     // persistés côté serveur (mail.messages.state_flags), plus un stand-in en lecture seule.
     write_logged(reader, "* FLAGS (\\Seen \\Deleted)\r\n").await?;
     write_logged(reader, "* OK [PERMANENTFLAGS (\\Seen \\Deleted)] flags reels (A04 §5.3)\r\n").await?;
-    write_logged(reader, &format!("* OK [UIDVALIDITY {UID_VALIDITY}]\r\n")).await?;
-    write_logged(reader, &format!("* OK [UIDNEXT {}]\r\n", count + 1)).await?;
+    // UIDVALIDITY stable (Point 2) et UIDNEXT = prochain UID à attribuer (jamais `count + 1` :
+    // un EXPUNGE laisse des trous, `uid_next` reste strictement au-dessus de tout UID déjà vu).
+    write_logged(reader, &format!("* OK [UIDVALIDITY {uid_validity}]\r\n")).await?;
+    write_logged(reader, &format!("* OK [UIDNEXT {uid_next}]\r\n")).await?;
     Ok(format!("{tag} OK [READ-WRITE] SELECT completed\r\n"))
 }
 
@@ -642,6 +871,7 @@ async fn cmd_status<S>(
     reader: &mut BufReader<S>,
     config: &BridgeConfig,
     http: &reqwest::Client,
+    uid_registry: &UidRegistry,
     session: &Session,
     tag: &str,
     args: &str,
@@ -661,15 +891,15 @@ where
         return Ok(format!("{tag} NO seule INBOX existe (V1 démo)\r\n"));
     }
 
-    let numbered = match fetch_mailbox_catalog(config, http, authed, "STATUS").await {
-        Ok(n) => n,
+    let view = match fetch_mailbox_catalog(config, http, uid_registry, authed, "STATUS").await {
+        Ok(v) => v,
         Err(e) => return Ok(format!("{tag} NO {e}\r\n")),
     };
-    let count = numbered.len() as u32;
+    let count = view.messages.len() as u32;
 
     // A04 §3/§5.3 réel : UNSEEN reflète maintenant l'état SERVEUR (mail.messages.state_flags),
     // pas une valeur figée — recalculé à chaque STATUS depuis le catalogue fraîchement tiré.
-    let unseen_count = numbered.iter().filter(|(_, m)| !m.read).count() as u32;
+    let unseen_count = view.messages.iter().filter(|(_, m)| !m.read).count() as u32;
 
     let requested = items_raw.trim_start_matches('(').trim_end_matches(')');
     let mut parts: Vec<String> = Vec::new();
@@ -677,8 +907,9 @@ where
         match tok.to_ascii_uppercase().as_str() {
             "MESSAGES" => parts.push(format!("MESSAGES {count}")),
             "RECENT" => parts.push("RECENT 0".to_string()),
-            "UIDNEXT" => parts.push(format!("UIDNEXT {}", count + 1)),
-            "UIDVALIDITY" => parts.push(format!("UIDVALIDITY {UID_VALIDITY}")),
+            // UIDNEXT stable (Point 2) : prochain UID à attribuer, jamais `count + 1`.
+            "UIDNEXT" => parts.push(format!("UIDNEXT {}", view.uid_next)),
+            "UIDVALIDITY" => parts.push(format!("UIDVALIDITY {}", view.uid_validity)),
             "UNSEEN" => parts.push(format!("UNSEEN {unseen_count}")),
             _ => {}
         }
@@ -698,6 +929,7 @@ async fn cmd_noop<S>(
     reader: &mut BufReader<S>,
     config: &BridgeConfig,
     http: &reqwest::Client,
+    uid_registry: &UidRegistry,
     session: &mut Session,
 ) -> std::io::Result<()>
 where
@@ -707,16 +939,16 @@ where
         return Ok(());
     }
     let authed = session.authed.as_ref().expect("vérifié ci-dessus");
-    let numbered = match fetch_mailbox_catalog(config, http, authed, "NOOP").await {
-        Ok(n) => n,
+    let view = match fetch_mailbox_catalog(config, http, uid_registry, authed, "NOOP").await {
+        Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "NOOP : échec du rafraîchissement du catalogue");
             return Ok(());
         }
     };
-    let new_count = numbered.len() as u32;
+    let new_count = view.messages.len() as u32;
     let old_count = session.mailbox.as_ref().map(|m| m.messages.len() as u32).unwrap_or(0);
-    session.mailbox = Some(SelectedMailbox { messages: numbered });
+    session.mailbox = Some(SelectedMailbox { messages: view.messages });
     if new_count != old_count {
         write_logged(reader, &format!("* {new_count} EXISTS\r\n")).await?;
         write_logged(reader, "* 0 RECENT\r\n").await?;
@@ -1077,10 +1309,13 @@ where
     let items = parse_fetch_items(items_spec);
 
     let count = mailbox.messages.len() as u32;
+    // UID FETCH : le set porte des UID, PAS des numéros de séquence — depuis le Point 2 les UID
+    // sont stables et ne valent plus `1..count` (un EXPUNGE laisse des trous, un nouveau message
+    // peut avoir un UID > count). On borne donc à l'UID MAXIMAL présent, pas au nombre de
+    // messages ; les UID absents seront de toute façon ignorés par le `find` ci-dessous.
+    let max_uid = mailbox.messages.iter().map(|(u, _)| *u).max().unwrap_or(0);
     let selected_numbers = if is_uid {
-        // UID FETCH : le set porte des UID, pas des numéros de séquence — on borne à l'UID
-        // maximal (== count ici, puisque nos UID sont 1..count).
-        parse_number_set(set_spec, count)
+        parse_number_set(set_spec, max_uid)
     } else {
         parse_number_set(set_spec, count)
     };
@@ -1261,7 +1496,10 @@ where
     }
 
     let count = mailbox.messages.len() as u32;
-    let selected_numbers = parse_number_set(&set_spec, count);
+    // UID STORE : comme UID FETCH, borner à l'UID maximal présent (Point 2 : UID stables, plus
+    // `1..count`) et non au nombre de messages, sinon un STORE sur un UID > count serait ignoré.
+    let max_uid = mailbox.messages.iter().map(|(u, _)| *u).max().unwrap_or(0);
+    let selected_numbers = parse_number_set(&set_spec, if is_uid { max_uid } else { count });
 
     let mut fetch_lines: Vec<String> = Vec::new();
     for n in selected_numbers {
@@ -1623,6 +1861,19 @@ fn require_auth(session: &SmtpSession) -> Option<&'static str> {
     }
 }
 
+/// Écrit une réponse SMTP sur le fil ET logue le texte EXACT envoyé, AVANT l'envoi — visible
+/// avec `RUST_LOG=diamy_bridged=debug`. Miroir de `write_logged` (IMAP) : permet de tracer le
+/// dialogue SMTP complet (chaque code de réponse posé sur le socket), notamment pour diagnostiquer
+/// à quel moment précis un rejet intervient. INV-21 : on ne loggue QUE des lignes de protocole
+/// (codes/textes de réponse), JAMAIS le corps `DATA` du message.
+async fn smtp_write<S>(reader: &mut BufReader<S>, line: &str) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tracing::debug!(smtp_response = %line.trim_end(), "reponse SMTP envoyee au client (brute)");
+    reader.get_mut().write_all(line.as_bytes()).await
+}
+
 async fn handle_smtp_connection(
     socket: TcpStream,
     config: Arc<BridgeConfig>,
@@ -1630,7 +1881,7 @@ async fn handle_smtp_connection(
     obs: Arc<diamy_obs::Obs>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(socket);
-    reader.get_mut().write_all(b"220 diamy-bridged ESMTP pret (A20-SMTP, demo)\r\n").await?;
+    smtp_write(&mut reader, "220 diamy-bridged ESMTP pret (A20-SMTP, demo)\r\n").await?;
 
     let mut session = SmtpSession { authed: None, mail_from: None, rcpt_to: Vec::new() };
 
@@ -1638,72 +1889,99 @@ async fn handle_smtp_connection(
         let line = match read_line_bounded(&mut reader).await? {
             LineRead::Eof => return Ok(()),
             LineRead::TooLong => {
-                reader.get_mut().write_all(b"500 ligne trop longue\r\n").await?;
+                smtp_write(&mut reader, "500 ligne trop longue\r\n").await?;
                 continue;
             }
             LineRead::Line(l) => l,
         };
         let upper = line.to_ascii_uppercase();
-        tracing::debug!(command = %upper.split_whitespace().next().unwrap_or(""), "commande SMTP recue");
+        // Ligne de commande SMTP brute (EHLO/MAIL/RCPT/DATA/QUIT...), visible avec
+        // RUST_LOG=diamy_bridged=debug. INV-21 : ce sont des commandes de protocole, JAMAIS le
+        // corps `DATA` (lu séparément par `read_smtp_data_bounded`, jamais loggué).
+        tracing::debug!(smtp_command = %line, "commande SMTP recue (brute)");
 
         if upper.starts_with("EHLO") || upper.starts_with("HELO") {
-            reader
-                .get_mut()
-                .write_all(b"250-diamy-bridged\r\n250-AUTH LOGIN PLAIN\r\n250 SIZE 10485760\r\n")
-                .await?;
+            smtp_write(&mut reader, "250-diamy-bridged\r\n250-AUTH LOGIN PLAIN\r\n250 SIZE 10485760\r\n").await?;
         } else if upper.starts_with("AUTH LOGIN") {
             cmd_auth_login(&mut reader, &config, &mut session).await?;
         } else if upper.starts_with("AUTH PLAIN") {
             cmd_auth_plain(&mut reader, &config, &mut session, line.trim_end()).await?;
         } else if upper.starts_with("MAIL FROM:") {
             if let Some(msg) = require_auth(&session) {
-                reader.get_mut().write_all(msg.as_bytes()).await?;
+                smtp_write(&mut reader, msg).await?;
                 continue;
             }
             match extract_addr(&line) {
                 Some(addr) => {
                     session.mail_from = Some(addr);
                     session.rcpt_to.clear();
-                    reader.get_mut().write_all(b"250 OK\r\n").await?;
+                    smtp_write(&mut reader, "250 OK\r\n").await?;
                 }
-                None => reader.get_mut().write_all(b"501 syntaxe MAIL FROM invalide\r\n").await?,
+                None => smtp_write(&mut reader, "501 syntaxe MAIL FROM invalide\r\n").await?,
             }
         } else if upper.starts_with("RCPT TO:") {
             if let Some(msg) = require_auth(&session) {
-                reader.get_mut().write_all(msg.as_bytes()).await?;
+                smtp_write(&mut reader, msg).await?;
                 continue;
             }
             if session.mail_from.is_none() {
-                reader.get_mut().write_all(b"503 MAIL FROM requis avant RCPT TO\r\n").await?;
+                smtp_write(&mut reader, "503 MAIL FROM requis avant RCPT TO\r\n").await?;
                 continue;
             }
             if session.rcpt_to.len() >= MAX_SMTP_RECIPIENTS {
-                reader.get_mut().write_all(b"452 trop de destinataires\r\n").await?;
+                smtp_write(&mut reader, "452 trop de destinataires\r\n").await?;
                 continue;
             }
             match extract_addr(&line).and_then(|raw| {
                 diamy_addr_canon(&raw, TenantAddressPolicy::default()).ok().map(|c| c.as_str().to_string())
             }) {
                 Some(canonical) => {
+                    // Rejet DÈS le RCPT TO (RFC 5321 §3.6.1) si le domaine n'est pas local : le
+                    // relais externe est désactivé en maquette (fail-closed, décision de Cédric),
+                    // donc ce destinataire ne sera JAMAIS accepté — inutile de faire téléverser le
+                    // DATA au client pour ne rejeter qu'ensuite (c'est ce qui laissait Thunderbird
+                    // bloqué sur "Envoi..."). On choisit `550 5.7.1` (relais refusé/livraison non
+                    // autorisée), le code canonique de "relaying denied" — permanent (5xx, pas de
+                    // retry) et clairement affiché par les clients ; 551/553 conviendraient aussi
+                    // mais 550 5.7.1 est le plus universellement reconnu pour un refus de relais.
+                    let domain = canonical.rsplit_once('@').map(|(_, d)| d).unwrap_or("");
+                    if !config.is_local_domain(domain) {
+                        tracing::info!(
+                            %domain,
+                            "RCPT TO REJETÉ dès le RCPT (relais externe désactivé en maquette)"
+                        );
+                        obs.events.with_label_values(&["diamy-bridged", "smtp_rcpt_rejected_external"]).inc();
+                        smtp_write(
+                            &mut reader,
+                            &format!(
+                                "550 5.7.1 relais externe desactive en maquette : le domaine \"{domain}\" \
+                                 n'est pas local, aucun envoi vers l'exterieur n'est possible\r\n"
+                            ),
+                        )
+                        .await?;
+                        continue;
+                    }
                     session.rcpt_to.push(canonical);
-                    reader.get_mut().write_all(b"250 OK\r\n").await?;
+                    smtp_write(&mut reader, "250 OK\r\n").await?;
                 }
-                None => reader.get_mut().write_all(b"501 adresse destinataire invalide\r\n").await?,
+                None => smtp_write(&mut reader, "501 adresse destinataire invalide\r\n").await?,
             }
         } else if upper.starts_with("DATA") {
             if let Some(msg) = require_auth(&session) {
-                reader.get_mut().write_all(msg.as_bytes()).await?;
+                smtp_write(&mut reader, msg).await?;
                 continue;
             }
             if session.rcpt_to.is_empty() {
-                reader.get_mut().write_all(b"554 aucun destinataire valide\r\n").await?;
+                // Aucun destinataire ACCEPTÉ (p. ex. tous rejetés dès le RCPT TO ci-dessus) —
+                // réponse dure immédiate, jamais une attente silencieuse.
+                smtp_write(&mut reader, "554 5.5.1 aucun destinataire valide (tous refuses)\r\n").await?;
                 continue;
             }
-            reader.get_mut().write_all(b"354 Terminez par <CRLF>.<CRLF>\r\n").await?;
+            smtp_write(&mut reader, "354 Terminez par <CRLF>.<CRLF>\r\n").await?;
             let read = read_smtp_data_bounded(&mut reader).await?;
             match read {
                 SmtpDataOutcome::TooLarge => {
-                    reader.get_mut().write_all(b"552 message trop volumineux\r\n").await?;
+                    smtp_write(&mut reader, "552 message trop volumineux\r\n").await?;
                 }
                 SmtpDataOutcome::Body(mut raw_message) => {
                     obs.events.with_label_values(&["diamy-bridged", "smtp_submit_attempt"]).inc();
@@ -1719,22 +1997,31 @@ async fn handle_smtp_connection(
                         submit_via_diamy_submitd(&config, &http, authed, &mail_from, &session.rcpt_to, &raw_message)
                             .await;
                     raw_message.zeroize(); // A10-EMIT-1 esprit : le clair d'émission ne survit pas au-delà de l'usage
+                    // Défense en profondeur : même si tous les destinataires externes sont
+                    // désormais rejetés dès le RCPT TO, on garde une réponse SMTP explicite ici
+                    // pour tout rejet que `diamy-submitd` prononcerait après coup — jamais une
+                    // connexion laissée en attente sans réponse (exigence de la mission, point 4).
                     match outcome {
                         Ok(true) => {
                             obs.events.with_label_values(&["diamy-bridged", "smtp_submit_accepted"]).inc();
-                            reader.get_mut().write_all(b"250 message accepte pour relais (A10)\r\n").await?;
+                            smtp_write(&mut reader, "250 message accepte pour relais (A10)\r\n").await?;
                         }
                         Ok(false) => {
                             obs.events.with_label_values(&["diamy-bridged", "smtp_submit_rejected"]).inc();
-                            reader.get_mut().write_all(b"554 echec du relais pour tous les destinataires\r\n").await?;
+                            smtp_write(
+                                &mut reader,
+                                "550 5.7.1 relais refuse pour tous les destinataires (relais externe desactive en maquette)\r\n",
+                            )
+                            .await?;
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "echec de la soumission vers diamy-submitd");
                             obs.events.with_label_values(&["diamy-bridged", "smtp_submit_error"]).inc();
-                            reader
-                                .get_mut()
-                                .write_all(b"451 echec temporaire : diamy-submitd injoignable, reessayez\r\n")
-                                .await?;
+                            smtp_write(
+                                &mut reader,
+                                "451 4.4.1 echec temporaire : diamy-submitd injoignable, reessayez\r\n",
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -1744,14 +2031,14 @@ async fn handle_smtp_connection(
         } else if upper.starts_with("RSET") {
             session.mail_from = None;
             session.rcpt_to.clear();
-            reader.get_mut().write_all(b"250 OK\r\n").await?;
+            smtp_write(&mut reader, "250 OK\r\n").await?;
         } else if upper.starts_with("NOOP") {
-            reader.get_mut().write_all(b"250 OK\r\n").await?;
+            smtp_write(&mut reader, "250 OK\r\n").await?;
         } else if upper.starts_with("QUIT") {
-            reader.get_mut().write_all(b"221 au revoir\r\n").await?;
+            smtp_write(&mut reader, "221 au revoir\r\n").await?;
             return Ok(());
         } else {
-            reader.get_mut().write_all(b"500 commande non reconnue\r\n").await?;
+            smtp_write(&mut reader, "500 commande non reconnue\r\n").await?;
         }
     }
 }
@@ -1764,26 +2051,26 @@ async fn cmd_auth_login<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    reader.get_mut().write_all(b"334 VXNlcm5hbWU6\r\n").await?; // "Username:"
+    smtp_write(reader, "334 VXNlcm5hbWU6\r\n").await?; // "Username:"
     let user_b64 = match read_line_bounded(reader).await? {
         LineRead::Line(l) => l,
         _ => {
-            reader.get_mut().write_all(b"501 authentification interrompue\r\n").await?;
+            smtp_write(reader, "501 authentification interrompue\r\n").await?;
             return Ok(());
         }
     };
-    reader.get_mut().write_all(b"334 UGFzc3dvcmQ6\r\n").await?; // "Password:"
+    smtp_write(reader, "334 UGFzc3dvcmQ6\r\n").await?; // "Password:"
     let pass_b64 = match read_line_bounded(reader).await? {
         LineRead::Line(l) => l,
         _ => {
-            reader.get_mut().write_all(b"501 authentification interrompue\r\n").await?;
+            smtp_write(reader, "501 authentification interrompue\r\n").await?;
             return Ok(());
         }
     };
 
     let (Ok(user_bytes), Ok(pass_bytes)) = (STANDARD.decode(user_b64.trim()), STANDARD.decode(pass_b64.trim()))
     else {
-        reader.get_mut().write_all(b"501 base64 invalide\r\n").await?;
+        smtp_write(reader, "501 base64 invalide\r\n").await?;
         return Ok(());
     };
     let user = String::from_utf8_lossy(&user_bytes).to_string();
@@ -1792,9 +2079,9 @@ where
     match authenticate_bridge_account(config, &user, &pass) {
         Ok(authed) => {
             session.authed = Some(authed);
-            reader.get_mut().write_all(b"235 authentification reussie\r\n").await?;
+            smtp_write(reader, "235 authentification reussie\r\n").await?;
         }
-        Err(_) => reader.get_mut().write_all(b"535 identifiants invalides\r\n").await?,
+        Err(_) => smtp_write(reader, "535 identifiants invalides\r\n").await?,
     }
     Ok(())
 }
@@ -1814,11 +2101,11 @@ where
     let b64 = match inline_b64 {
         Some(b) if !b.is_empty() => b.to_string(),
         _ => {
-            reader.get_mut().write_all(b"334 \r\n").await?;
+            smtp_write(reader, "334 \r\n").await?;
             match read_line_bounded(reader).await? {
                 LineRead::Line(l) => l,
                 _ => {
-                    reader.get_mut().write_all(b"501 authentification interrompue\r\n").await?;
+                    smtp_write(reader, "501 authentification interrompue\r\n").await?;
                     return Ok(());
                 }
             }
@@ -1826,13 +2113,13 @@ where
     };
 
     let Ok(decoded) = STANDARD.decode(b64.trim()) else {
-        reader.get_mut().write_all(b"501 base64 invalide\r\n").await?;
+        smtp_write(reader, "501 base64 invalide\r\n").await?;
         return Ok(());
     };
     // RFC 4954 : `\0authzid\0authcid\0password` — on ignore `authzid`, on utilise `authcid`.
     let parts: Vec<&[u8]> = decoded.split(|b| *b == 0).collect();
     let Some((user_bytes, pass_bytes)) = parts.get(1).zip(parts.get(2)) else {
-        reader.get_mut().write_all(b"501 format AUTH PLAIN invalide\r\n").await?;
+        smtp_write(reader, "501 format AUTH PLAIN invalide\r\n").await?;
         return Ok(());
     };
     let user = String::from_utf8_lossy(user_bytes).to_string();
@@ -1841,9 +2128,9 @@ where
     match authenticate_bridge_account(config, &user, &pass) {
         Ok(authed) => {
             session.authed = Some(authed);
-            reader.get_mut().write_all(b"235 authentification reussie\r\n").await?;
+            smtp_write(reader, "235 authentification reussie\r\n").await?;
         }
-        Err(_) => reader.get_mut().write_all(b"535 identifiants invalides\r\n").await?,
+        Err(_) => smtp_write(reader, "535 identifiants invalides\r\n").await?,
     }
     Ok(())
 }
@@ -2044,6 +2331,76 @@ mod tests {
         assert_eq!(to_rfc2822_date("n'importe quoi"), "n'importe quoi");
         assert_eq!(to_rfc2822_date(""), "");
     }
+
+    // --- Point 2 : mécanique du registre d'UID stables (unitaire, sans réseau) ---------------
+
+    fn tmp_registry() -> UidRegistry {
+        UidRegistry::new(std::env::temp_dir().join(format!("diamy-uidreg-unit-{}", Uuid::now_v7())))
+    }
+
+    /// Cœur de la correction : un message garde son UID, un nouveau reçoit un compteur
+    /// strictement croissant, et l'UID d'un message disparu n'est JAMAIS réattribué.
+    #[tokio::test]
+    async fn uids_are_stable_and_counter_is_monotonic() {
+        let reg = tmp_registry();
+        let p = Uuid::now_v7();
+        let (a, b, c) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+
+        let (_v, next, uids) = reg.resolve(p, &[a, b, c]).await;
+        assert_eq!(uids, vec![1, 2, 3], "attribution dans l'ordre chronologique reçu");
+        assert_eq!(next, 4, "UIDNEXT = prochain UID à attribuer");
+
+        // Re-résolution partielle (B disparu, comme après un EXPUNGE) : A et C gardent leur UID.
+        let (_v, next2, uids2) = reg.resolve(p, &[a, c]).await;
+        assert_eq!(uids2, vec![1, 3], "A=1 et C=3 conservés, jamais recalculés par position");
+        assert_eq!(next2, 4, "aucun nouvel UID attribué → compteur inchangé");
+
+        // Un nouveau message D : reçoit 4 (jamais 2, l'UID libéré par B).
+        let d = Uuid::now_v7();
+        let (_v, next3, uids3) = reg.resolve(p, &[a, c, d]).await;
+        assert_eq!(uids3, vec![1, 3, 4], "D reçoit un UID NEUF (4), jamais l'UID 2 de B");
+        assert_eq!(next3, 5);
+    }
+
+    #[tokio::test]
+    async fn uid_state_persists_across_registry_instances_same_dir() {
+        let dir = std::env::temp_dir().join(format!("diamy-uidreg-persist-{}", Uuid::now_v7()));
+        let p = Uuid::now_v7();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+
+        let (v1, _n, uids1) = UidRegistry::new(dir.clone()).resolve(p, &[a, b]).await;
+        assert_eq!(uids1, vec![1, 2]);
+
+        // Nouvelle instance, MÊME répertoire (simule un redémarrage) : UID ET validity conservés.
+        let reg2 = UidRegistry::new(dir.clone());
+        let (v2, _n, uids2) = reg2.resolve(p, &[a, b]).await;
+        assert_eq!(uids2, vec![1, 2], "les UID survivent au redémarrage (persistance)");
+        assert_eq!(v2, v1, "UIDVALIDITY stable entre démarrages tant que l'état est sain");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_or_incoherent_state_triggers_a_fresh_bump() {
+        let reg = tmp_registry();
+        let p = Uuid::now_v7();
+        std::fs::create_dir_all(&reg.dir).unwrap();
+
+        // Fichier illisible (JSON invalide) → état frais, jamais un panic ni une lecture douteuse.
+        std::fs::write(reg.state_path(p), b"{ ceci n'est pas du json").unwrap();
+        let fresh = reg.load_or_fresh(p);
+        assert!(fresh.uid_validity > 0 && fresh.uid_next == 1 && fresh.entries.is_empty());
+
+        // État syntaxiquement valide mais INCOHÉRENT (UID >= uid_next) → traité comme corrompu.
+        let bad = MailboxUidState { uid_validity: 1, uid_next: 2, entries: [(Uuid::now_v7(), 5)].into_iter().collect() };
+        assert!(!UidRegistry::is_coherent(&bad), "un UID hors [1, uid_next) est incohérent");
+        let dup = MailboxUidState {
+            uid_validity: 1,
+            uid_next: 3,
+            entries: [(Uuid::now_v7(), 1), (Uuid::now_v7(), 1)].into_iter().collect(),
+        };
+        assert!(!UidRegistry::is_coherent(&dup), "deux message_id partageant un UID est incohérent");
+    }
 }
 
 /// Round-trip complet du chemin SORTANT (A20-SMTP-1 / A10, tranche démo) : un VRAI client SMTP
@@ -2079,6 +2436,12 @@ mod smtp_roundtrip_tests {
     /// renvoyer directement le port qu'il a choisi.
     fn free_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind port libre").local_addr().unwrap().port()
+    }
+
+    /// Répertoire d'état d'UID (Point 2) UNIQUE et jetable, hors du `bridge_state/` de dev — pour
+    /// que chaque test parte d'un registre vierge et observe des UID déterministes.
+    fn unique_uid_state_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("diamy-bridged-uidstate-{}", Uuid::now_v7()))
     }
 
     fn find_diamy_mxd_binary() -> PathBuf {
@@ -2261,8 +2624,20 @@ mod smtp_roundtrip_tests {
         }
     }
 
+    /// Sérialise les tests d'intégration qui enrôlent le device Bridge du MÊME compte de fixture
+    /// (`hugo@w3.tel`) sur la base de dev PARTAGÉE. `ensure_bridge_device_enrolled` régénère un
+    /// `device_id` à CHAQUE appel et écrase le fichier de clé partagé : deux tests hugo en
+    /// parallèle se clobbereraient (un message scellé pour l'ancien device deviendrait
+    /// indéchiffrable après ré-enrôlement concurrent → "message introuvable" intermittent). Ce
+    /// verrou rend le déroulé déterministe sans dépendre de l'ordonnancement des threads de test.
+    fn hugo_account_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     #[tokio::test]
     async fn full_round_trip_thunderbird_send_to_local_recipient_arrives_decryptable() {
+        let _serialize_hugo = hugo_account_lock().lock().await;
         let database_url = test_database_url();
         let pool = storage::connect(&database_url).await.expect("Postgres de dev doit tourner (`docker compose up`)");
         let blob_store = storage::BlobStore::at("./blob_store").expect("object store local");
@@ -2290,6 +2665,9 @@ mod smtp_roundtrip_tests {
             mxd_relay_port: mxd_smtp_port,
             external_relay_port: 25,
             helo_domain: "submit-test.w3.tel".to_string(),
+            // Ce round-trip n'émet que vers un destinataire LOCAL (cedric@w3.tel) : le relais
+            // externe reste désactivé (fail-closed), exactement comme en maquette.
+            allow_external_relay: false,
         });
         let submitd_auth = diamy_submitd::auth::AuthState {
             app_keys: diamy_submitd::auth::AppKeyStore::seeded_from_env(),
@@ -2313,6 +2691,7 @@ mod smtp_roundtrip_tests {
             sync_base: "https://127.0.0.1:0".to_string(),
             app_key: "devonly_change_me_appkey_bridge_dev_client".to_string(),
             submit_url: format!("https://127.0.0.1:{submitd_port}/submit"),
+            local_domains: vec!["w3.tel".to_string()],
         });
         let http = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
         let obs = Arc::new(diamy_obs::Obs::new("diamy-bridged-test"));
@@ -2550,6 +2929,10 @@ mod smtp_roundtrip_tests {
     /// la session Bridge.
     #[tokio::test]
     async fn imap_store_and_expunge_round_trip_against_real_maild() {
+        // Sérialisé avec les autres tests hugo (voir `hugo_account_lock`) : évite qu'un
+        // ré-enrôlement concurrent du device Bridge de hugo n'invalide notre message scellé.
+        let _serialize_hugo = hugo_account_lock().lock().await;
+
         let database_url = test_database_url();
         let pool = storage::connect(&database_url).await.expect("Postgres de dev doit tourner (`docker compose up`)");
         let blob_store = storage::BlobStore::at("./blob_store").expect("object store local");
@@ -2583,9 +2966,13 @@ mod smtp_roundtrip_tests {
             sync_base: format!("https://127.0.0.1:{maild_port}"),
             app_key: "devonly_change_me_appkey_bridge_dev_client".to_string(),
             submit_url: "https://127.0.0.1:0/submit".to_string(), // non utilisé par ce test (pas d'envoi)
+            local_domains: vec!["w3.tel".to_string()],
         });
         let http = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
         let obs = Arc::new(diamy_obs::Obs::new("diamy-bridged-imap-test"));
+        // Répertoire d'état d'UID ISOLÉ pour ce test (Point 2) — jamais partagé avec le state de
+        // dev ni avec un autre test, pour que les UID observés soient déterministes.
+        let uid_registry = Arc::new(UidRegistry::new(unique_uid_state_dir()));
         let imap_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let imap_addr = imap_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2593,9 +2980,10 @@ mod smtp_roundtrip_tests {
                 let Ok((socket, _peer)) = imap_listener.accept().await else { break };
                 let cfg = bridge_config.clone();
                 let http = http.clone();
+                let uid_registry = uid_registry.clone();
                 let obs = obs.clone();
                 tokio::spawn(async move {
-                    let _ = handle_connection(socket, cfg, http, obs).await;
+                    let _ = handle_connection(socket, cfg, http, uid_registry, obs).await;
                 });
             }
         });
@@ -2692,5 +3080,259 @@ mod smtp_roundtrip_tests {
         );
 
         let _ = client.cmd("a9", "LOGOUT").await;
+    }
+
+    /// Extrait l'UID d'une réponse `FETCH ... (UID n ...)` et joint le corps pour recherche du
+    /// marqueur — helper du test de stabilité d'UID ci-dessous.
+    fn uid_from_fetch_lines(lines: &[String]) -> Option<u32> {
+        for l in lines {
+            if let Some(p) = l.find("FETCH (UID ") {
+                let rest = &l[p + "FETCH (UID ".len()..];
+                let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(u) = num.parse::<u32>() {
+                    return Some(u);
+                }
+            }
+        }
+        None
+    }
+
+    /// Parcourt les séquences 1..=count et retourne l'UID du message dont le corps contient
+    /// `marker` (via un vrai `FETCH seq (UID BODY[])`) — jamais une position devinée.
+    async fn find_uid_by_marker(client: &mut ImapTestClient, count: u32, marker: &str) -> Option<u32> {
+        for seq in 1..=count {
+            let lines = client.cmd("uf", &format!("FETCH {seq} (UID BODY[])")).await;
+            if lines.iter().any(|l| l.contains(marker)) {
+                return uid_from_fetch_lines(&lines);
+            }
+        }
+        None
+    }
+
+    fn exists_count(select_lines: &[String]) -> u32 {
+        let line = select_lines.iter().find(|l| l.contains("EXISTS")).expect("SELECT doit annoncer EXISTS");
+        line.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
+    /// **Preuve du Point 2 — reproduction EXACTE du scénario de bug de l'audit.** Boîte avec 3
+    /// messages A/B/C ; on note leurs UID ; on supprime B (`UID STORE \Deleted` + `EXPUNGE`) ;
+    /// un nouveau message D arrive ; puis on vérifie que :
+    ///   1. l'UID qui désignait B n'est JAMAIS réattribué à D (le bug d'origine : D héritait de
+    ///      l'UID caché par un client pour B) ;
+    ///   2. A et C gardent EXACTEMENT leurs UID d'origine tout du long ;
+    ///   3. `UIDVALIDITY` ne change pas (les UID sont stables, plus besoin de bump).
+    /// Tout passe par le VRAI protocole IMAP contre un VRAI subprocess `diamy-maild` + Postgres,
+    /// avec un registre d'UID persisté ISOLÉ pour ce test.
+    #[tokio::test]
+    async fn uid_of_expunged_message_is_never_reassigned_to_a_new_message() {
+        let database_url = test_database_url();
+        let pool = storage::connect(&database_url).await.expect("Postgres de dev doit tourner (`docker compose up`)");
+        let blob_store = storage::BlobStore::at("./blob_store").expect("object store local");
+
+        let maild_port = free_port();
+        let maild_metrics_port = free_port();
+        let _maild = spawn_maild_subprocess(maild_port, maild_metrics_port, &database_url).await;
+
+        // Compte DÉDIÉ à ce test (aubin@w3.tel) — les autres tests d'intégration ré-enrôlent le
+        // device Bridge de hugo/cedric en parallèle ; utiliser un compte distinct évite qu'une
+        // ré-enrôlement concurrente n'invalide le device sous lequel nos messages sont scellés.
+        ensure_bridge_device_enrolled(&pool, "aubin@w3.tel").await;
+        let iam = DevIamClient::seeded();
+        let principal = iam.resolve_principal("aubin@w3.tel").unwrap();
+        let domain = principal.address.domain_alabel().to_string();
+        let (bridge_device_id, _sec) =
+            load_device_secret(&bridge_dev_secret_path("aubin@w3.tel")).expect("clé Bridge chargeable");
+
+        // --- 3 messages A, B, C dans cet ordre chronologique. Marqueurs uniques par run. ---
+        let run = Uuid::now_v7();
+        let (marker_a, marker_b, marker_c, marker_d) = (
+            format!("uidstab-A-{run}"),
+            format!("uidstab-B-{run}"),
+            format!("uidstab-C-{run}"),
+            format!("uidstab-D-{run}"),
+        );
+        for m in [&marker_a, &marker_b, &marker_c] {
+            store_message_for_bridge(&pool, &blob_store, principal.id, &domain, bridge_device_id, m).await;
+            // Espace les `received_at` pour un ordre chronologique A<B<C non ambigu.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // --- Bridge IMAP en-process, registre d'UID PERSISTÉ mais ISOLÉ (fichier jetable). ---
+        let bridge_config = Arc::new(BridgeConfig {
+            imap_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            smtp_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            imap_user: "aubin@w3.tel".to_string(),
+            imap_password: "devonly_change_me_bridge_password".to_string(),
+            sync_base: format!("https://127.0.0.1:{maild_port}"),
+            app_key: "devonly_change_me_appkey_bridge_dev_client".to_string(),
+            submit_url: "https://127.0.0.1:0/submit".to_string(),
+            local_domains: vec!["w3.tel".to_string()],
+        });
+        let http = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
+        let obs = Arc::new(diamy_obs::Obs::new("diamy-bridged-uidstab-test"));
+        let uid_registry = Arc::new(UidRegistry::new(unique_uid_state_dir()));
+        let imap_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let imap_addr = imap_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _peer)) = imap_listener.accept().await else { break };
+                let cfg = bridge_config.clone();
+                let http = http.clone();
+                let uid_registry = uid_registry.clone();
+                let obs = obs.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(socket, cfg, http, uid_registry, obs).await;
+                });
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = ImapTestClient::connect(imap_addr).await;
+        let _greeting = client.read_line().await;
+        let login = client.cmd("a1", "LOGIN aubin@w3.tel devonly_change_me_bridge_password").await;
+        assert!(login.last().unwrap().starts_with("a1 OK"), "LOGIN : {login:?}");
+
+        // --- SELECT initial : note UIDVALIDITY + les UID de A, B, C. ---
+        let select1 = client.cmd("a2", "SELECT INBOX").await;
+        let count1 = exists_count(&select1);
+        let uidvalidity1: u32 = {
+            let l = select1.iter().find(|l| l.contains("UIDVALIDITY")).expect("UIDVALIDITY annoncée");
+            let p = l.find("UIDVALIDITY ").unwrap() + "UIDVALIDITY ".len();
+            l[p..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
+        };
+
+        let uid_a = find_uid_by_marker(&mut client, count1, &marker_a).await.expect("A doit être présent");
+        let uid_b = find_uid_by_marker(&mut client, count1, &marker_b).await.expect("B doit être présent");
+        let uid_c = find_uid_by_marker(&mut client, count1, &marker_c).await.expect("C doit être présent");
+        assert!(uid_a != uid_b && uid_b != uid_c && uid_a != uid_c, "A/B/C doivent avoir des UID distincts");
+
+        // --- Supprime B : UID STORE \Deleted (exerce aussi la borne max_uid) puis EXPUNGE. ---
+        let store = client.cmd("a3", &format!("UID STORE {uid_b} +FLAGS (\\Deleted)")).await;
+        assert!(store.last().unwrap().starts_with("a3 OK"), "UID STORE \\Deleted : {store:?}");
+        let expunge = client.cmd("a4", "EXPUNGE").await;
+        assert!(expunge.last().unwrap().starts_with("a4 OK"), "EXPUNGE : {expunge:?}");
+
+        // --- Un nouveau message D arrive APRÈS la suppression de B. ---
+        store_message_for_bridge(&pool, &blob_store, principal.id, &domain, bridge_device_id, &marker_d).await;
+
+        // --- Nouveau SELECT (nouvelle interrogation réseau + re-résolution des UID). ---
+        let select2 = client.cmd("a5", "SELECT INBOX").await;
+        let count2 = exists_count(&select2);
+        let uidvalidity2: u32 = {
+            let l = select2.iter().find(|l| l.contains("UIDVALIDITY")).unwrap();
+            let p = l.find("UIDVALIDITY ").unwrap() + "UIDVALIDITY ".len();
+            l[p..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
+        };
+
+        let uid_a2 = find_uid_by_marker(&mut client, count2, &marker_a).await.expect("A toujours présent");
+        let uid_c2 = find_uid_by_marker(&mut client, count2, &marker_c).await.expect("C toujours présent");
+        let uid_d = find_uid_by_marker(&mut client, count2, &marker_d).await.expect("D doit être présent");
+        let b_still_there = find_uid_by_marker(&mut client, count2, &marker_b).await;
+
+        // === Les 4 preuves du scénario de bug de l'audit. ===
+        assert!(b_still_there.is_none(), "B doit avoir disparu de la boîte après EXPUNGE");
+        assert_eq!(uid_a2, uid_a, "A doit garder EXACTEMENT son UID d'origine ({uid_a}) tout du long");
+        assert_eq!(uid_c2, uid_c, "C doit garder EXACTEMENT son UID d'origine ({uid_c}) tout du long");
+        assert_ne!(
+            uid_d, uid_b,
+            "l'UID de B ({uid_b}) ne doit JAMAIS être réattribué au nouveau message D ({uid_d}) — c'est LE bug"
+        );
+        assert!(uid_d != uid_a && uid_d != uid_c, "D doit avoir un UID neuf, distinct de A et C");
+        assert!(
+            uid_d > uid_b && uid_d > uid_a && uid_d > uid_c,
+            "un nouveau message doit recevoir un UID strictement croissant (jamais réutilisé) : D={uid_d}"
+        );
+        assert_eq!(
+            uidvalidity2, uidvalidity1,
+            "UIDVALIDITY doit rester stable (les UID sont désormais réellement stables, pas de bump)"
+        );
+
+        let _ = client.cmd("a6", "LOGOUT").await;
+    }
+
+    /// Écrit UNIQUEMENT le fichier de clé d'appareil Bridge en local (16 o `device_id` + clé
+    /// secrète brute), sans rien publier en base — suffisant pour `authenticate_bridge_account`,
+    /// qui ne consulte que ce fichier + la fixture de jetons. Rend le test de rejet RCPT
+    /// hermétique (ni Postgres, ni sous-processus).
+    fn write_local_bridge_device(canonical: &str) {
+        let (_pub, sec) = crypto::generate_device_keypair().unwrap();
+        let device_id = Uuid::now_v7();
+        let path = bridge_dev_secret_path(canonical);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut bytes = Vec::with_capacity(16 + sec.as_bytes().len());
+        bytes.extend_from_slice(device_id.as_bytes());
+        bytes.extend_from_slice(sec.as_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+    }
+
+    /// **Preuve de la correction UX (mission SMTP)** : un `RCPT TO` vers une adresse EXTERNE est
+    /// rejeté DÈS le RCPT TO (code `550` permanent, RFC 5321 §3.6.1), AVANT tout `DATA` — le
+    /// client (Thunderbird) reçoit une erreur claire immédiate au lieu de rester bloqué sur
+    /// "Envoi du message...". Hermétique : ni Postgres ni sous-processus (le rejet intervient
+    /// avant toute interaction réseau avec diamy-maild/submitd). Compte `cedric@w3.tel` : son
+    /// fichier de clé Bridge n'est utilisé par aucun autre test (pas de course concurrente).
+    #[tokio::test]
+    async fn external_rcpt_is_rejected_at_rcpt_to_before_data() {
+        let address = "cedric@w3.tel";
+        let canonical = diamy_addr_canon(address, TenantAddressPolicy::default()).unwrap();
+        write_local_bridge_device(canonical.as_str());
+
+        let bridge_config = Arc::new(BridgeConfig {
+            imap_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            smtp_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            imap_user: address.to_string(),
+            imap_password: "devonly_change_me_bridge_password".to_string(),
+            sync_base: "https://127.0.0.1:0".to_string(),
+            app_key: "devonly_change_me_appkey_bridge_dev_client".to_string(),
+            submit_url: "https://127.0.0.1:0/submit".to_string(),
+            local_domains: vec!["w3.tel".to_string()],
+        });
+        let http = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
+        let obs = Arc::new(diamy_obs::Obs::new("diamy-bridged-rcpt-test"));
+        let smtp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smtp_addr = smtp_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _peer)) = smtp_listener.accept().await else { break };
+                let cfg = bridge_config.clone();
+                let http = http.clone();
+                let obs = obs.clone();
+                tokio::spawn(async move {
+                    let _ = handle_smtp_connection(socket, cfg, http, obs).await;
+                });
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = SmtpTestClient::connect(smtp_addr).await;
+        assert!(client.read_line().await.starts_with("220"), "bannière SMTP");
+        assert!(client.cmd("EHLO thunderbird-test").await.starts_with("250"));
+        assert_eq!(client.cmd("AUTH LOGIN").await, "334 VXNlcm5hbWU6");
+        assert_eq!(client.cmd(&STANDARD.encode(address)).await, "334 UGFzc3dvcmQ6");
+        assert!(client.cmd(&STANDARD.encode("devonly_change_me_bridge_password")).await.starts_with("235"));
+
+        assert!(client.cmd("MAIL FROM:<cedric@w3.tel>").await.starts_with("250"));
+
+        // Cœur du test : RCPT TO externe → 550 IMMÉDIAT (jamais 250), donc AUCUN DATA n'est
+        // téléversé — plus de "chargement infini" côté client.
+        let rcpt = client.cmd("RCPT TO:<test@gmail.com>").await;
+        assert!(
+            rcpt.starts_with("550"),
+            "un destinataire externe doit être rejeté DÈS le RCPT TO (550 permanent), obtenu : {rcpt}"
+        );
+        assert!(
+            rcpt.contains("5.7.1") || rcpt.to_lowercase().contains("relais externe"),
+            "le rejet doit porter un message clair (relais externe désactivé) : {rcpt}"
+        );
+
+        // Contraste : un destinataire LOCAL est bien accepté (250 OK) au RCPT TO.
+        assert!(
+            client.cmd("RCPT TO:<hugo@w3.tel>").await.starts_with("250"),
+            "un destinataire local doit rester accepté au RCPT TO"
+        );
+
+        assert!(client.cmd("QUIT").await.starts_with("221"));
     }
 }

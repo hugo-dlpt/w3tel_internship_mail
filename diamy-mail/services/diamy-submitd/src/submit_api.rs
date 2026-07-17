@@ -11,6 +11,13 @@
 //! destinataire dont le domaine appartient à `local_domains` est réinjecté dans `diamy-mxd`
 //! comme un message entrant ordinaire — pas de vrai serveur MX externe nécessaire pour la
 //! démo "Thunderbird envoie → Thunderbird reçoit".
+//!
+//! **Relais externe DÉSACTIVÉ (décision de Cédric, maquette — fail-closed)** : un destinataire
+//! hors des `local_domains` est REJETÉ proprement (`rejected_external_relay_disabled`), jamais
+//! relayé vers Internet — aucune connexion SMTP sortante n'est même tentée. Tout envoi est
+//! strictement confiné à `w3.tel`. Le chemin de relais externe historique n'est réactivable que
+//! par `DIAMY_SUBMITD_ALLOW_EXTERNAL_RELAY=1`, jamais positionnée en maquette (voir
+//! `SIMPLIFICATIONS.md`).
 
 use crate::relay::{self, RelayOutcome};
 use axum::{extract::State, middleware, routing::post, Json, Router};
@@ -32,8 +39,30 @@ pub struct SubmitdConfig {
     pub mxd_relay_port: u16,
     /// Port utilisé pour la relance vers un domaine EXTERNE — **simplification assumée** :
     /// connexion directe à `<domaine>:<port>`, PAS de résolution MX (voir `relay.rs`).
+    /// N'a d'effet QUE si `allow_external_relay` est `true` (jamais le cas en maquette).
     pub external_relay_port: u16,
     pub helo_domain: String,
+    /// **Décision de Cédric (maquette) : relais externe DÉSACTIVÉ, fail-closed.** Par défaut
+    /// `false` — un destinataire hors des `local_domains` est REJETÉ proprement, jamais relayé
+    /// vers l'extérieur (aucune connexion SMTP sortante vers Internet n'est même tentée). Le
+    /// chemin de relais externe historique reste dans le code mais n'est réactivable QUE par
+    /// `DIAMY_SUBMITD_ALLOW_EXTERNAL_RELAY=1` — une variable qui n'est JAMAIS positionnée en
+    /// maquette (absence de variable = pas de relais externe possible, jamais l'inverse). Voir
+    /// `SIMPLIFICATIONS.md`.
+    pub allow_external_relay: bool,
+}
+
+/// Décision de routage pour UN destinataire — extraite en fonction pure (sans I/O réseau) pour
+/// être testable directement : c'est ici que la garde fail-closed du relais externe est prise
+/// (décision de Cédric, voir `SubmitdConfig::allow_external_relay`).
+#[derive(Debug, PartialEq, Eq)]
+enum RelayRoute<'a> {
+    /// Domaine local → réinjection dans `diamy-mxd` (boucle fermée de démo).
+    Local { host: &'a str, port: u16 },
+    /// Domaine externe AVEC relais explicitement autorisé (jamais en maquette).
+    External { host: &'a str, port: u16 },
+    /// Domaine externe SANS autorisation (cas par défaut, fail-closed) → rejet, pas de connexion.
+    RejectedExternalDisabled,
 }
 
 impl SubmitdConfig {
@@ -63,18 +92,42 @@ impl SubmitdConfig {
         let helo_domain =
             std::env::var("DIAMY_SUBMITD_HELO_DOMAIN").unwrap_or_else(|_| "submit.w3.tel".to_string());
 
+        // Fail-closed : SEULES les valeurs `1`/`true` (insensibles à la casse) réactivent le
+        // relais externe. Toute autre valeur — et surtout l'ABSENCE de la variable — laisse le
+        // relais externe désactivé. On ne peut donc jamais l'activer "par erreur" (faute de
+        // frappe dans une adresse, mauvaise config) : il faut un geste délibéré et explicite.
+        let allow_external_relay = std::env::var("DIAMY_SUBMITD_ALLOW_EXTERNAL_RELAY")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true"
+            })
+            .unwrap_or(false);
+
         Ok(Self {
             local_domains,
             mxd_relay_host: mxd_relay_host.to_string(),
             mxd_relay_port,
             external_relay_port,
             helo_domain,
+            allow_external_relay,
         })
     }
 
     fn is_local_domain(&self, domain: &str) -> bool {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         self.local_domains.iter().any(|d| d == &domain)
+    }
+
+    /// Décide où (ou si) relayer pour ce `domain`. Fonction PURE — aucune connexion réseau, tout
+    /// le fail-closed du relais externe est décidé ici (voir `RelayRoute`).
+    fn route_for<'a>(&'a self, domain: &'a str) -> RelayRoute<'a> {
+        if self.is_local_domain(domain) {
+            RelayRoute::Local { host: &self.mxd_relay_host, port: self.mxd_relay_port }
+        } else if self.allow_external_relay {
+            RelayRoute::External { host: domain, port: self.external_relay_port }
+        } else {
+            RelayRoute::RejectedExternalDisabled
+        }
     }
 }
 
@@ -164,10 +217,28 @@ async fn relay_one_recipient(
         };
     };
 
-    let (host, port, local): (&str, u16, bool) = if config.is_local_domain(domain) {
-        (&config.mxd_relay_host, config.mxd_relay_port, true)
-    } else {
-        (domain, config.external_relay_port, false)
+    let (host, port, local): (&str, u16, bool) = match config.route_for(domain) {
+        RelayRoute::Local { host, port } => (host, port, true),
+        RelayRoute::External { host, port } => (host, port, false),
+        RelayRoute::RejectedExternalDisabled => {
+            // Fail-closed (décision de Cédric, maquette) : AUCUNE connexion SMTP sortante n'est
+            // ouverte pour un destinataire hors des domaines locaux — on rejette proprement
+            // AVANT tout dialogue réseau. Le message n'est ni relayé, ni silencieusement ignoré.
+            tracing::warn!(
+                %domain,
+                "destinataire hors domaines locaux REJETÉ (relais externe désactivé en maquette)"
+            );
+            return RecipientOutcome {
+                recipient: recipient.to_string(),
+                status: "rejected_external_relay_disabled",
+                detail: Some(format!(
+                    "relais externe désactivé en maquette (décision Cédric) : le domaine « {domain} » \
+                     n'est pas dans les domaines locaux ({}) — tout envoi est confiné à ces domaines, \
+                     aucun relais vers l'extérieur n'est possible",
+                    config.local_domains.join(", ")
+                )),
+            };
+        }
     };
 
     let outcome = relay::relay_via_smtp(host, port, &config.helo_domain, mail_from, recipient, raw_message).await;
@@ -212,6 +283,8 @@ mod tests {
             mxd_relay_port: 2525,
             external_relay_port: 25,
             helo_domain: "submit.w3.tel".to_string(),
+            // Maquette : fail-closed par défaut (décision de Cédric).
+            allow_external_relay: false,
         }
     }
 
@@ -220,5 +293,62 @@ mod tests {
         let cfg = test_config();
         assert!(cfg.is_local_domain("W3.TEL"));
         assert!(!cfg.is_local_domain("example.fr"));
+    }
+
+    /// La garde fail-closed est décidée par `route_for` — testée ici PUREMENT (aucun réseau) :
+    /// un domaine local est routé en local ; un domaine externe est REJETÉ par défaut ; et n'est
+    /// routé vers l'extérieur QUE si le relais externe a été explicitement réactivé.
+    #[test]
+    fn route_for_rejects_external_by_default() {
+        let cfg = test_config();
+        // Domaine local → réinjection locale (boucle fermée de démo).
+        assert!(matches!(cfg.route_for("w3.tel"), RelayRoute::Local { .. }));
+        // Domaine externe, relais désactivé (défaut maquette) → rejet, jamais de route externe.
+        assert_eq!(cfg.route_for("gmail.com"), RelayRoute::RejectedExternalDisabled);
+    }
+
+    #[test]
+    fn route_for_allows_external_only_when_explicitly_enabled() {
+        let cfg = SubmitdConfig { allow_external_relay: true, ..test_config() };
+        // Le chemin externe n'existe QUE derrière le flag jamais activé en maquette.
+        assert_eq!(
+            cfg.route_for("gmail.com"),
+            RelayRoute::External { host: "gmail.com", port: 25 }
+        );
+        // Un domaine local reste local même flag activé.
+        assert!(matches!(cfg.route_for("w3.tel"), RelayRoute::Local { .. }));
+    }
+
+    /// Preuve du Point 1 (fail-closed) : une soumission vers une adresse HORS w3.tel est REJETÉE,
+    /// pas silencieusement ignorée ni relayée. `relay_one_recipient` retourne le statut de rejet
+    /// SANS ouvrir de connexion SMTP sortante — c'est justement ce qui rend ce test hermétique
+    /// (aucun accès réseau vers gmail.com : le rejet est prononcé avant tout dialogue).
+    #[tokio::test]
+    async fn external_recipient_is_rejected_not_relayed() {
+        let cfg = test_config(); // fail-closed (défaut maquette)
+        let outcome =
+            relay_one_recipient(&cfg, "hugo@w3.tel", "test@gmail.com", b"From: hugo@w3.tel\r\n\r\nx\r\n").await;
+
+        assert_eq!(
+            outcome.status, "rejected_external_relay_disabled",
+            "un destinataire hors w3.tel doit être REJETÉ (jamais relayé ni ignoré)"
+        );
+        assert_ne!(outcome.status, "relayed_external", "aucun relais externe ne doit avoir lieu");
+        assert_ne!(outcome.status, "relayed_local", "gmail.com n'est pas un domaine local");
+        let detail = outcome.detail.expect("le rejet doit porter un message d'erreur explicite");
+        assert!(
+            detail.contains("relais externe désactivé"),
+            "le message doit indiquer clairement que le relais externe est désactivé : {detail}"
+        );
+        assert_eq!(outcome.recipient, "test@gmail.com");
+    }
+
+    /// Un destinataire sans domaine reste rejeté comme adresse invalide (comportement inchangé) —
+    /// on vérifie que la garde fail-closed ne l'a pas masqué.
+    #[tokio::test]
+    async fn recipient_without_domain_is_rejected_as_invalid() {
+        let cfg = test_config();
+        let outcome = relay_one_recipient(&cfg, "hugo@w3.tel", "pas-de-domaine", b"x").await;
+        assert_eq!(outcome.status, "rejected_invalid_address");
     }
 }

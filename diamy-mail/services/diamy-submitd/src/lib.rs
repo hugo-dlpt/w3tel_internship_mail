@@ -16,8 +16,14 @@
 //! SPF/DKIM/DMARC (SEC-OUT-2 non enforce), PAS de rate limiting/circuit breaker (A10-RL), PAS
 //! d'allocation de pool d'envoi (A23), PAS de copie « Envoyés » chiffrée côté client (A02
 //! §5.2), PAS de retry/DSN (A10-RETRY). Ce qui EST fait : authentification à deux facteurs
-//! (`auth.rs`), un VRAI dialogue SMTP sortant par destinataire (`relay.rs`), et — pour la
-//! démo en boucle fermée — réinjection dans `diamy-mxd` quand le destinataire est local.
+//! (`auth.rs`), un VRAI dialogue SMTP sortant vers `diamy-mxd` pour la démo en boucle fermée
+//! (`relay.rs`, réinjection quand le destinataire est local).
+//!
+//! **Relais externe DÉSACTIVÉ (décision de Cédric, maquette, fail-closed)** : tout destinataire
+//! hors des domaines locaux (`w3.tel`) est REJETÉ proprement, jamais relayé vers Internet —
+//! aucune connexion sortante externe n'est même tentée. Le chemin externe historique n'est
+//! réactivable que par `DIAMY_SUBMITD_ALLOW_EXTERNAL_RELAY=1`, jamais positionnée en maquette
+//! (voir `submit_api.rs` et `SIMPLIFICATIONS.md`).
 #![forbid(unsafe_code)]
 
 pub mod auth;

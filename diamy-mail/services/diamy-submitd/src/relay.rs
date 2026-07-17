@@ -13,6 +13,13 @@
 //! **Simplification assumée** : pas de résolution MX (A10 ne l'exige pas explicitement pour
 //! cette tranche, mais un vrai `diamy-submitd` le ferait) — la relance externe se connecte
 //! directement à `<domaine>:<port>`, un stand-in honnête, pas une implémentation complète.
+//!
+//! **Relais externe DÉSACTIVÉ en maquette (décision de Cédric, fail-closed)** : ce module reste
+//! le moteur du dialogue SMTP, mais `submit_api.rs` ne l'appelle plus JAMAIS avec un hôte
+//! externe par défaut — un destinataire hors des domaines locaux est rejeté AVANT toute
+//! connexion (`RelayRoute::RejectedExternalDisabled`). `relay_via_smtp` n'est donc plus utilisé
+//! que pour la réinjection LOCALE dans `diamy-mxd` (boucle fermée de démo), sauf réactivation
+//! explicite et jamais-par-défaut du relais externe (`DIAMY_SUBMITD_ALLOW_EXTERNAL_RELAY=1`).
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
