@@ -17,3 +17,14 @@ serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 base64.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# Test de bout en bout (round-trip complet du chemin sortant, A20-SMTP-1) : dépend de
+# `diamy-submitd` comme LIBRAIRIE (son propre routeur réel, en-process) et de
+# `diamy-mail-storage`/`sqlx` pour enrôler un destinataire de test et vérifier la réception
+# côté `diamy-mxd` (processus séparé, jamais modifié — voir le test pour le détail).
+diamy-submitd = { path = "../diamy-submitd" }
+diamy-mail-storage = { path = "../../crates/diamy-mail-storage" }
+sqlx.workspace = true
+axum-server.workspace = true

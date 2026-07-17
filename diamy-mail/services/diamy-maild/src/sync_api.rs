@@ -23,11 +23,11 @@ use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
     middleware,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use diamy_mail_storage::{self as storage, BlobStore};
+use diamy_mail_storage::{self as storage, BlobStore, FlagsUpdate};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -44,6 +44,11 @@ struct MessageSummaryDto {
     sender_canonical: Option<String>,
     size_bytes: i64,
     received_at: Option<String>,
+    /// A04 §3/§5.3 : état réel serveur-autoritaire (`mail.messages.state_flags`), pas un stand-in
+    /// local au Bridge — c'est ce champ qui rend `\Seen`/`\Deleted` visibles depuis N'IMPORTE
+    /// QUELLE session IMAP sur le même principal (preuve du test multi-connexion).
+    read: bool,
+    deleted: bool,
 }
 
 type ApiError = (StatusCode, String);
@@ -86,6 +91,8 @@ async fn list_messages(
                 sender_canonical: m.sender_canonical,
                 size_bytes: m.size_bytes,
                 received_at: m.received_at.map(|t| t.to_string()),
+                read: m.read,
+                deleted: m.deleted,
             })
             .collect(),
     ))
@@ -162,6 +169,114 @@ async fn fetch_message(
     }))
 }
 
+/// Corps commun aux deux opérations d'état mutantes (A04 §5.3/§6) : `message_id` la cible,
+/// `idempotency_key` un UUIDv7 généré CLIENT (A04-IDEM-1) — jamais par ce serveur. Le format
+/// exact du corps JSON n'est pas normatif dans A04 (seul le comportement l'est : idempotence,
+/// séquence renvoyée) — un choix de convention documenté (voir `SIMPLIFICATIONS.md`), dans le
+/// même esprit que le schéma des claims du jeton mail-plane.
+#[derive(Deserialize)]
+struct StateFlagsRequest {
+    message_id: Uuid,
+    idempotency_key: Uuid,
+    /// A04-EP-4bis (v1.4) : `\Seen` — booléen réversible, LWW par champ (A03-SYNC-1/2).
+    read: Option<bool>,
+    /// A04-EP-4bis (v1.4) : `deleted` — booléen réversible, PAS l'action de purge/déplacement
+    /// (qui reste `/state/delete`, ci-dessous) — c'est le tombstone IMAP `\Deleted` AVANT EXPUNGE.
+    deleted: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct StateDeleteRequest {
+    message_id: Uuid,
+    idempotency_key: Uuid,
+    /// Cette implémentation ne câble QUE `"hard"` (A04 v1.4 changelog : le Bridge, mono-dossier,
+    /// n'exerce que la purge). `"soft"` est un mode valide d'A04 §5.3 mais rejeté ICI en
+    /// `ERR_VALIDATION` plutôt que silencieusement mal exécuté (fail-closed, INV-16).
+    mode: String,
+}
+
+#[derive(Serialize)]
+struct StateOpResponse {
+    /// A04-EP-4 : "the response returns the assigned sequence so the client can order local
+    /// state" — la séquence de journal assignée à CET événement.
+    sequence: i64,
+}
+
+/// Point commun aux deux handlers ci-dessous : vérifie la clé d'idempotence AVANT d'exécuter
+/// quoi que ce soit (A04-IDEM-1) — `None` si c'est la PREMIÈRE exécution sous cette clé (au
+/// handler d'exécuter puis d'enregistrer via `record_idempotency`), `Some(...)` si la requête a
+/// déjà été traitée (l'appelant DOIT alors renvoyer ce résultat SANS réappliquer l'effet).
+async fn already_applied(pool: &storage::PgPool, idempotency_key: Uuid) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    let existing = storage::check_idempotency(pool, idempotency_key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(existing.map(|r| Json(r.response_body)))
+}
+
+/// `POST /v1/mailbox/:principal_id/state/flags` (A04 §5.3/A04-EP-4bis) : delta read/deleted,
+/// idempotent, journalisé (`flags_changed`). Jamais de contenu déchiffré/re-chiffré ici — cette
+/// opération ne touche QUE `mail.messages.state_flags` (métadonnée), jamais `summary_ct`/
+/// `body_ct`/les enveloppes (A25 INV-1/2, périmètre non négociable de cette fonctionnalité).
+async fn state_flags(
+    Extension(identity): Extension<AuthenticatedIdentity>,
+    State(state): State<SyncState>,
+    Path(principal_id): Path<Uuid>,
+    Json(req): Json<StateFlagsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if identity.principal_id != principal_id {
+        return Err((StatusCode::NOT_FOUND, "introuvable".to_string()));
+    }
+    if let Some(cached) = already_applied(&state.pool, req.idempotency_key).await? {
+        return Ok(cached);
+    }
+
+    let update = FlagsUpdate { read: req.read, deleted: req.deleted };
+    let sequence = storage::apply_state_flags(&state.pool, principal_id, req.message_id, &update)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    let body = serde_json::to_value(StateOpResponse { sequence })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    storage::record_idempotency(&state.pool, req.idempotency_key, principal_id, "state/flags", &body, sequence)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(body))
+}
+
+/// `POST /v1/mailbox/:principal_id/state/delete` (A04 §5.3) : purge (mode `"hard"` uniquement
+/// dans cette implémentation, voir `StateDeleteRequest`), idempotente, journalisée
+/// (`message_deleted`).
+async fn state_delete(
+    Extension(identity): Extension<AuthenticatedIdentity>,
+    State(state): State<SyncState>,
+    Path(principal_id): Path<Uuid>,
+    Json(req): Json<StateDeleteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if identity.principal_id != principal_id {
+        return Err((StatusCode::NOT_FOUND, "introuvable".to_string()));
+    }
+    if req.mode != "hard" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "ERR_VALIDATION: seul mode=\"hard\" est câblé dans cette implémentation (A04 v1.4 changelog)".to_string(),
+        ));
+    }
+    if let Some(cached) = already_applied(&state.pool, req.idempotency_key).await? {
+        return Ok(cached);
+    }
+
+    let sequence = storage::purge_message(&state.pool, &state.blob_store, principal_id, req.message_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    let body = serde_json::to_value(StateOpResponse { sequence })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    storage::record_idempotency(&state.pool, req.idempotency_key, principal_id, "state/delete", &body, sequence)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(body))
+}
+
 /// Le middleware d'auth (`auth.rs`) est appliqué en `.layer(...)` sur TOUT le routeur,
 /// pas par endpoint (A18-ERR-5, forbidden pattern #14) : toute route ajoutée ici plus
 /// tard hérite automatiquement des deux vérifications, dans l'ordre, sans rien faire de
@@ -173,6 +288,8 @@ pub fn router(state: SyncState, auth: AuthState) -> Router {
             "/v1/mailbox/:principal_id/messages/:message_id",
             get(fetch_message),
         )
+        .route("/v1/mailbox/:principal_id/state/flags", post(state_flags))
+        .route("/v1/mailbox/:principal_id/state/delete", post(state_delete))
         .layer(middleware::from_fn_with_state(auth, crate::auth::mail_plane_auth_middleware))
         .with_state(state)
 }
@@ -614,5 +731,241 @@ mod tests {
         assert_eq!(resp.status(), 401);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["code"], "ERR_APPKEY_INVALID");
+    }
+
+    // --- Tests A04 §3/§5.3/§6 réels (état lu/supprimé, journal, idempotence) ---------------
+
+    /// Requête POST authentifiée (même en-têtes que `authed_get`).
+    fn authed_post(client: &reqwest::Client, url: &str, token: &str, body: &serde_json::Value) -> reqwest::RequestBuilder {
+        client
+            .post(url)
+            .header("x-app-key", TEST_APPKEY_RAW)
+            .header("x-app-name", TEST_APPKEY_NAME)
+            .header("x-app-platform", TEST_APPKEY_PLATFORM)
+            .header("x-app-version", "0.0.1")
+            .header("authorization", format!("Bearer {token}"))
+            .json(body)
+    }
+
+    /// Preuve n°1 (mission §6, point 1) : marquer `\Seen` via `/state/flags` sur une session,
+    /// puis vérifier via un GET depuis une AUTRE connexion HTTP (un second `reqwest::Client`,
+    /// pas de réutilisation de socket/état) que le flag est bien persisté CÔTÉ SERVEUR — pas
+    /// seulement en mémoire de la session qui a émis la requête.
+    #[tokio::test]
+    async fn state_flags_read_persists_across_a_separate_connection() {
+        let (state, pool) = test_state().await;
+        let iam = diamy_mail_iam::DevIamClient::seeded();
+        let principal = iam.resolve_principal("cedric@w3.tel").unwrap();
+        let (device_id, _device_sec) = enroll_device_for_test(&pool, principal.id).await;
+        let marker = format!("marqueur-{}", Uuid::now_v7());
+        let message_id = store_test_message(
+            &pool, &state.blob_store, principal.id, principal.address.domain_alabel(), device_id, &marker,
+        )
+        .await;
+
+        let base_url = spawn_test_api(state).await;
+        let token = fixture_token("valid_cedric");
+
+        // Session 1 : marque \Seen.
+        let client_a = test_https_client();
+        let flags_url = format!("{base_url}/v1/mailbox/{}/state/flags", principal.id);
+        let resp = authed_post(
+            &client_a,
+            &flags_url,
+            &token,
+            &serde_json::json!({ "message_id": message_id, "idempotency_key": Uuid::now_v7(), "read": true }),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["sequence"].as_i64().unwrap() > 0, "A04-EP-4 : la séquence assignée doit être renvoyée");
+
+        // Session 2 : un `reqwest::Client` INDÉPENDANT (aucun état partagé avec client_a) relit
+        // le catalogue — c'est la preuve que l'état vit en base, pas dans le processus HTTP émetteur.
+        let client_b = test_https_client();
+        let list_url = format!("{base_url}/v1/mailbox/{}/messages", principal.id);
+        let messages: Vec<serde_json::Value> = authed_get(&client_b, &list_url, &token).send().await.unwrap().json().await.unwrap();
+        let found = messages.iter().find(|m| m["message_id"] == message_id.to_string()).expect("message présent");
+        assert_eq!(found["read"], true, "le flag \\Seen doit être visible depuis une AUTRE connexion (A04 §3)");
+        assert_eq!(found["deleted"], false);
+    }
+
+    /// Preuve n°2 (mission §6, point 2) : rejouer la MÊME requête d'état avec la MÊME clé
+    /// d'idempotence ne doit produire AUCUN effet dupliqué (A04-IDEM-1) — même si le corps
+    /// rejoué prétend changer la valeur, le résultat retourné (et l'état réel) reste celui de
+    /// la PREMIÈRE exécution.
+    #[tokio::test]
+    async fn state_flags_idempotency_key_replay_has_no_duplicate_effect() {
+        let (state, pool) = test_state().await;
+        let iam = diamy_mail_iam::DevIamClient::seeded();
+        let principal = iam.resolve_principal("hugo@w3.tel").unwrap();
+        let (device_id, _device_sec) = enroll_device_for_test(&pool, principal.id).await;
+        let marker = format!("marqueur-{}", Uuid::now_v7());
+        let message_id = store_test_message(
+            &pool, &state.blob_store, principal.id, principal.address.domain_alabel(), device_id, &marker,
+        )
+        .await;
+
+        let base_url = spawn_test_api(state).await;
+        let token = fixture_token("valid_hugo");
+        let client = test_https_client();
+        let flags_url = format!("{base_url}/v1/mailbox/{}/state/flags", principal.id);
+        let idempotency_key = Uuid::now_v7();
+
+        // Premier appel : read=true.
+        let first = authed_post(
+            &client, &flags_url, &token,
+            &serde_json::json!({ "message_id": message_id, "idempotency_key": idempotency_key, "read": true }),
+        )
+        .send().await.unwrap();
+        assert_eq!(first.status(), 200);
+        let first_body: serde_json::Value = first.json().await.unwrap();
+        let first_seq = first_body["sequence"].as_i64().unwrap();
+
+        // Rejeu : MÊME clé, corps prétendant AU CONTRAIRE remettre read=false — s'il était
+        // ré-appliqué, le message redeviendrait non-lu.
+        let replay = authed_post(
+            &client, &flags_url, &token,
+            &serde_json::json!({ "message_id": message_id, "idempotency_key": idempotency_key, "read": false }),
+        )
+        .send().await.unwrap();
+        assert_eq!(replay.status(), 200);
+        let replay_body: serde_json::Value = replay.json().await.unwrap();
+        assert_eq!(
+            replay_body["sequence"].as_i64().unwrap(), first_seq,
+            "un rejeu sous la même clé DOIT renvoyer la séquence de la PREMIÈRE exécution, jamais en assigner une nouvelle"
+        );
+
+        // État réel : toujours read=true (le rejeu n'a RIEN changé), preuve par une nouvelle
+        // lecture du catalogue.
+        let list_url = format!("{base_url}/v1/mailbox/{}/messages", principal.id);
+        let messages: Vec<serde_json::Value> = authed_get(&client, &list_url, &token).send().await.unwrap().json().await.unwrap();
+        let found = messages.iter().find(|m| m["message_id"] == message_id.to_string()).expect("message présent");
+        assert_eq!(found["read"], true, "le rejeu sous la même clé d'idempotence ne doit PAS avoir remis read à false (A04-IDEM-1)");
+    }
+
+    /// Preuve n°3 (mission §6, point 3) : marquer `\Deleted` puis `/state/delete` (mode hard)
+    /// purge réellement le message — un nouveau GET (l'équivalent SELECT/STATUS du Bridge) ne
+    /// le voit plus, et cet état est bien persisté en base (pas local à une session Bridge).
+    #[tokio::test]
+    async fn state_delete_hard_purges_and_removal_is_persisted() {
+        // NB isolation de test (voir SIMPLIFICATIONS.md) : `aubin@w3.tel` est réservé comme
+        // principal "jamais enrôlé" dans toute la suite (tests de hold-queue de `diamy-mxd`
+        // s'appuient sur zéro appareil actif pour ce principal) — on utilise `cedric` ici.
+        let (state, pool) = test_state().await;
+        let iam = diamy_mail_iam::DevIamClient::seeded();
+        let principal = iam.resolve_principal("cedric@w3.tel").unwrap();
+        let (device_id, _device_sec) = enroll_device_for_test(&pool, principal.id).await;
+        let marker = format!("marqueur-{}", Uuid::now_v7());
+        let message_id = store_test_message(
+            &pool, &state.blob_store, principal.id, principal.address.domain_alabel(), device_id, &marker,
+        )
+        .await;
+
+        let base_url = spawn_test_api(state).await;
+        let token = fixture_token("valid_cedric");
+        let client = test_https_client();
+
+        // \Deleted d'abord (réversible, A04-EP-4bis) — puis la purge terminale.
+        let flags_url = format!("{base_url}/v1/mailbox/{}/state/flags", principal.id);
+        authed_post(
+            &client, &flags_url, &token,
+            &serde_json::json!({ "message_id": message_id, "idempotency_key": Uuid::now_v7(), "deleted": true }),
+        )
+        .send().await.unwrap();
+
+        let delete_url = format!("{base_url}/v1/mailbox/{}/state/delete", principal.id);
+        let resp = authed_post(
+            &client, &delete_url, &token,
+            &serde_json::json!({ "message_id": message_id, "idempotency_key": Uuid::now_v7(), "mode": "hard" }),
+        )
+        .send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Nouveau GET (nouvelle requête HTTP, équivalent d'un nouveau SELECT/STATUS Bridge) :
+        // le message ne doit plus apparaître — état persisté, pas un artefact de session.
+        let list_url = format!("{base_url}/v1/mailbox/{}/messages", principal.id);
+        let messages: Vec<serde_json::Value> = authed_get(&client, &list_url, &token).send().await.unwrap().json().await.unwrap();
+        assert!(
+            !messages.iter().any(|m| m["message_id"] == message_id.to_string()),
+            "le message purgé ne doit plus apparaître dans le catalogue (A02-DEL-1)"
+        );
+    }
+
+    /// Preuve n°4 (mission §6, point 4) : deux "appareils" (deux `device_id` enrôlés
+    /// séparément) sur le MÊME `principal_id`, simulant deux connexions IMAP distinctes — l'un
+    /// marque un message comme lu, l'autre, en re-listant, voit bien le changement. C'est la
+    /// preuve d'une synchronisation RÉELLE (état serveur-autoritaire), pas d'un état local à
+    /// un appareil.
+    #[tokio::test]
+    async fn two_devices_same_principal_see_each_others_state_changes() {
+        let (state, pool) = test_state().await;
+        let iam = diamy_mail_iam::DevIamClient::seeded();
+        let principal = iam.resolve_principal("cedric@w3.tel").unwrap();
+        // Deux appareils DISTINCTS enrôlés pour le MÊME principal (deux "connexions IMAP").
+        let (device_a, _sec_a) = enroll_device_for_test(&pool, principal.id).await;
+        let (device_b, _sec_b) = enroll_device_for_test(&pool, principal.id).await;
+        assert_ne!(device_a, device_b);
+
+        let marker = format!("marqueur-{}", Uuid::now_v7());
+        // Livré à device_a (peu importe pour l'état lu/supprimé, qui est une métadonnée de
+        // PRINCIPAL — A21 §2.2 — pas une métadonnée par appareil).
+        let message_id = store_test_message(
+            &pool, &state.blob_store, principal.id, principal.address.domain_alabel(), device_a, &marker,
+        )
+        .await;
+
+        let base_url = spawn_test_api(state).await;
+        let token = fixture_token("valid_cedric");
+
+        // "Appareil A" marque le message comme lu.
+        let client_device_a = test_https_client();
+        let flags_url = format!("{base_url}/v1/mailbox/{}/state/flags", principal.id);
+        let resp = authed_post(
+            &client_device_a, &flags_url, &token,
+            &serde_json::json!({ "message_id": message_id, "idempotency_key": Uuid::now_v7(), "read": true }),
+        )
+        .send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // "Appareil B" (connexion HTTP totalement indépendante) re-sélectionne et doit voir le
+        // changement — la synchronisation passe par le serveur, jamais par un canal local.
+        let client_device_b = test_https_client();
+        let list_url = format!("{base_url}/v1/mailbox/{}/messages", principal.id);
+        let messages: Vec<serde_json::Value> =
+            authed_get(&client_device_b, &list_url, &token).send().await.unwrap().json().await.unwrap();
+        let found = messages.iter().find(|m| m["message_id"] == message_id.to_string()).expect("message présent");
+        assert_eq!(
+            found["read"], true,
+            "l'appareil B doit voir l'état marqué par l'appareil A en re-sélectionnant (A04 §3, sync réelle)"
+        );
+    }
+
+    /// `/state/delete` ne câble QUE le mode `"hard"` (A04 v1.4 changelog) : `"soft"` est
+    /// rejeté explicitement (fail-closed, INV-16), jamais silencieusement mal exécuté.
+    #[tokio::test]
+    async fn state_delete_soft_mode_is_rejected_not_silently_mishandled() {
+        let (state, pool) = test_state().await;
+        let iam = diamy_mail_iam::DevIamClient::seeded();
+        let principal = iam.resolve_principal("hugo@w3.tel").unwrap();
+        let (device_id, _device_sec) = enroll_device_for_test(&pool, principal.id).await;
+        let marker = format!("marqueur-{}", Uuid::now_v7());
+        let message_id = store_test_message(
+            &pool, &state.blob_store, principal.id, principal.address.domain_alabel(), device_id, &marker,
+        )
+        .await;
+
+        let base_url = spawn_test_api(state).await;
+        let token = fixture_token("valid_hugo");
+        let client = test_https_client();
+        let delete_url = format!("{base_url}/v1/mailbox/{}/state/delete", principal.id);
+        let resp = authed_post(
+            &client, &delete_url, &token,
+            &serde_json::json!({ "message_id": message_id, "idempotency_key": Uuid::now_v7(), "mode": "soft" }),
+        )
+        .send().await.unwrap();
+        assert_eq!(resp.status(), 400);
     }
 }

@@ -99,8 +99,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let obs = Arc::new(diamy_obs::Obs::new("diamy-maild"));
-    let addr = "0.0.0.0:9101";
-    let listener = TcpListener::bind(addr).await?;
+    // Configurable comme `DIAMY_MXD_METRICS_ADDR` côté diamy-mxd (parité de port, utile pour
+    // faire tourner plusieurs instances de test en parallèle d'une instance de dev déjà lancée
+    // sur le port par défaut) — défaut inchangé.
+    let addr = std::env::var("DIAMY_MAILD_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9101".to_string());
+    let listener = TcpListener::bind(&addr).await?;
     tracing::info!(
         service = "diamy-maild",
         backend = crypto::backend_name(),

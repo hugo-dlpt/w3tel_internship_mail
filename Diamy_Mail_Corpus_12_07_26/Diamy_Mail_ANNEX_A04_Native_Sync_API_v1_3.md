@@ -1,7 +1,7 @@
 # Diamy Mail — ANNEX A04: Native Sync API
 
 **Document title:** Diamy Mail — ANNEX A04: Native Sync API
-**Version:** 1.3
+**Version:** 1.4
 **Status:** Internal Draft
 **Author:** Cédric BORNECQUE
 **Date:** July 4th 2026
@@ -15,6 +15,7 @@
 
 | Version | Date         | Author           | Changelog                |
 | ------- | ------------ | ---------------- | ------------------------ |
+| 1.4     | Jul 17th 2026 | Written by: session Claude Code — decided directly with Hugo DELEPORTE (in-session; not escalated to Cédric, since this closes an implementation-detail gap within already-decided direction rather than an invariant conflict, A25 Constitution rule 4 threshold) | **Closed a gap this annex left open**: §5.3's table described `/state/flags`'s fields as "read/answered/flagged/tags" only, with no field covering IMAP's reversible `\Deleted`-before-`EXPUNGE` toggle, while `/state/delete` was described only as the trash-move/purge *action* — neither literally accommodated a reversible pre-purge tombstone, and no "undelete" operation existed anywhere in this annex. Resolved: **`deleted` is now an explicit boolean field of `/state/flags`** (§5.3 table + A04-EP-4bis), participating in the same per-field LWW/journal-sequence discipline as read/answered/flagged (A03-SYNC-1/2) and emitting `flags_changed` — fully reversible by re-sending `deleted:false`, unlike `/state/delete` which remains a one-way terminal action. Rationale: A21-JRN-1's event catalogue (`message_added/deleted`, `flags_changed`, `folder_changed`, ...) has no dedicated tombstone-toggle or undelete event, so routing a reversible flag through `flags_changed` — the event type already designed for exactly this kind of per-field, reversible metadata change — fits the existing model better than inventing a new event or overloading `/state/delete` with a reversal it was never specified to support. Also recorded: the reference implementation (`diamy-bridged`) exercises `/state/delete` in **hard-purge mode only** on IMAP `EXPUNGE` (soft/Trash-move remains a valid mode of this endpoint per §5.3 but is not exercised — the bridge is single-folder, no Trash folder is wired). |
 | 1.0     | Jul 4th 2026 | Cédric BORNECQUE | Initial document: native sync protocol (NOT IMAP), transport (WSS + HTTPS), authentication binding to mail-plane token, journal-cursor sync model, endpoint catalogue (catalogue pages, blob fetch, envelope fetch, submission, state ops, folder ops, key-directory publication), pagination rules, notification signals (no content push), idempotency + outbound queue, conflict inputs (per-field LWW feed), request signing, full-resync handshake, failure model, observability, test scenarios, common AI errors |
 | 1.2     | Jul 4th 2026 | Cédric BORNECQUE | Coherence update: the Bridge (A20) is now a committed, specified feature — updated §1 and deferred-items to reference A20 as shipped (IMAP/SMTP/CalDAV via the client SDK on top of this native API, no protocol change) rather than "deferred". |
 | 1.3     | Jul 4th 2026 | Cédric BORNECQUE | Corrected A04-TR-2 after reviewing the Diamy IAM – Integration Specification v1.6: every request now correctly requires TWO independently-validated credentials — the Tier 2 Diamy Mail AppKey (local, AppKey-first per A17-APPKEY-5) and the mail-plane token — previously conflated as one undifferentiated header set. Renamed `ERR_EPOCH_REVOKED` to the mechanism-neutral `ERR_SESSION_REVOKED` and added `ERR_APPKEY_INVALID`, consistent with A17-TOK-2's flagged (unconfirmed) revocation mechanism — the 10 s bound (A04-TR-4) is now stated as a target pending that confirmation, not an implemented fact. Added test scenarios #10–11 and AI errors #14–16 for the AppKey model. |
@@ -109,7 +110,7 @@ All paths are prefixed `/mail/v1`. All bodies JSON unless noted. All endpoints r
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
-| POST | `/state/flags` | Set read/answered/flagged/tags on message(s) |
+| POST | `/state/flags` | Set read/answered/flagged/**deleted**/tags on message(s) |
 | POST | `/state/move` | Move message(s) to a folder |
 | POST | `/state/delete` | Move to Trash (soft) or purge (hard) |
 | POST | `/folders/create` | Create a folder (client supplies `name_ct`) |
@@ -117,6 +118,7 @@ All paths are prefixed `/mail/v1`. All bodies JSON unless noted. All endpoints r
 | POST | `/folders/delete` | Delete folder (messages handled per request policy) |
 
 - **A04-EP-4**: Every mutating state op MUST carry a client-generated **idempotency key** (§6) and MUST be safe to retry. The server records the op in the journal with a monotonic sequence; that sequence is the authority for per-field LWW conflict resolution (A03-SYNC-1). The response returns the assigned sequence so the client can order local state.
+- **A04-EP-4bis** (`deleted` as a reversible flag — added v1.4): `deleted` is a boolean field of `/state/flags`, resolved per-field-LWW exactly like `read`/`answered`/`flagged` (A03-SYNC-1/2) and emitting `flags_changed`, NOT `message_deleted`. Setting it MUST be fully reversible (a subsequent `deleted:false` undoes it) — this is the IMAP `\Deleted`-before-`EXPUNGE` semantics: a client marks a message for deletion, may still unmark it, and only `/state/delete` (a separate, one-way call) performs the actual Trash-move or purge. A client MUST NOT infer that setting `deleted:true` via `/state/flags` has moved or purged anything — those effects only happen via an explicit `/state/delete` call.
 - **A04-EP-5**: `tags` operations MUST be expressed as add/remove deltas, not full-set replacement, so the server journal reflects the union-merge semantics (A03-SYNC-2). A full-set replacement would race-clobber a concurrent device's tag.
 
 ## 5.4 Outbound submission

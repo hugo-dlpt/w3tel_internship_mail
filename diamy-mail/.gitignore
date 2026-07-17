@@ -8,13 +8,16 @@ Cargo.lock.orig
 # le catalogue ; ceci simule le stockage des blobs chiffrés hors base, en local.
 /services/diamy-maild/blob_store/
 /services/diamy-mxd/blob_store/
+/services/diamy-bridged/blob_store/
 /blob_store/
 
 # Stand-in de dev pour le coffre sécurisé de l'OS (INV-4) — clés privées d'appareils de
-# test générées par `enroll_test_device`. Ne DOIT jamais être commité (ce sont des clés
-# privées, même de test) ni exister en dehors de cette machine de dev.
+# test générées par `enroll_test_device`/`enroll_bridge_device` (et par le test d'intégration
+# `smtp_roundtrip_tests`, qui les régénère à chaque exécution). Ne DOIT jamais être commité (ce
+# sont des clés privées, même de test) ni exister en dehors de cette machine de dev.
 /dev_secrets/
 /crates/diamy-mail-storage/dev_secrets/
+/services/diamy-bridged/dev_secrets/
 
 # Sink d'audit distinct (INV-20, A18-LOG-3) — JSON-lines des actions privilégiées.
 # Local à la machine de dev ; un vrai déploiement l'envoie à un sink d'audit durable.

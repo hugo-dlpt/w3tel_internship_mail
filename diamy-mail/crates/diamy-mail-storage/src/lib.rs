@@ -100,6 +100,21 @@ impl BlobStore {
     fn read(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
         Ok(std::fs::read(self.path_for(object_key))?)
     }
+
+    /// A02-DEL-2 : suppression VÉRIFIÉE (suppression + contrôle d'inexistence), pas un simple
+    /// "best effort" silencieux. Idempotent : un objet déjà absent n'est pas une erreur.
+    fn delete(&self, object_key: &str) -> Result<(), StorageError> {
+        let path = self.path_for(object_key);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        if path.exists() {
+            return Err(StorageError::Io(std::io::Error::other(
+                "le blob est toujours présent après tentative de suppression (A02-DEL-2)",
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Trouve (ou crée) le dossier système `inbox` d'un principal (A21 §2.1).
@@ -371,23 +386,47 @@ pub async fn fetch_message_for_device(
 
 /// Résumé catalogue d'un message — PLAINTEXT_METADATA uniquement (A21 §2.2), jamais de
 /// contenu. C'est ce qu'un client sync liste avant de tirer un message précis.
+///
+/// `read`/`deleted` sont lus depuis `state_flags` (A21 §2.2, JSONB) : le VRAI état
+/// serveur-autoritaire (A04 §3/§5.3), pas un cache local au Bridge — c'est ce qui rend `\Seen`/
+/// `\Deleted` visibles depuis N'IMPORTE QUELLE session/connexion IMAP sur le même principal
+/// (A04-SYNC, preuve du test multi-connexion, voir `SIMPLIFICATIONS.md`).
 pub struct MessageSummary {
     pub message_id: Uuid,
     pub sender_canonical: Option<String>,
     pub size_bytes: i64,
     pub received_at: Option<sqlx::types::time::OffsetDateTime>,
+    pub read: bool,
+    pub deleted: bool,
+}
+
+fn flag_from_state(state_flags: &serde_json::Value, field: &str) -> bool {
+    state_flags.get(field).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 /// Liste les messages les plus récents d'un principal, bornée (A18-BOUND-1).
 /// Simplification assumée (voir `SIMPLIFICATIONS.md`) : borne fixe, pas de curseur de
 /// pagination conforme A04-PAGE-1 (pas d'OFFSET malgré tout — tri direct par date desc).
+///
+/// Un message `\Deleted` (state_flags.deleted = true) reste dans cette liste — IMAP exige
+/// qu'un message marqué pour suppression reste visible (avec son flag) jusqu'à l'EXPUNGE qui le
+/// PURGE réellement (A02-DEL-1) ; seule la purge fait disparaître la ligne.
 pub async fn list_recent_messages(
     pool: &PgPool,
     principal_id: Uuid,
     limit: i64,
 ) -> Result<Vec<MessageSummary>, StorageError> {
-    let rows: Vec<(Uuid, Option<String>, i64, Option<sqlx::types::time::OffsetDateTime>)> = sqlx::query_as(
-        "SELECT message_id, sender_canonical, size_bytes, received_at
+    // Tuple de projection SQL — reconstruit immédiatement en `MessageSummary` juste en dessous
+    // (même style que `list_held_for_principal`).
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        Uuid,
+        Option<String>,
+        i64,
+        Option<sqlx::types::time::OffsetDateTime>,
+        serde_json::Value,
+    )> = sqlx::query_as(
+        "SELECT message_id, sender_canonical, size_bytes, received_at, state_flags
          FROM mail.messages
          WHERE principal_id = $1
          ORDER BY received_at DESC NULLS LAST
@@ -400,13 +439,192 @@ pub async fn list_recent_messages(
 
     Ok(rows
         .into_iter()
-        .map(|(message_id, sender_canonical, size_bytes, received_at)| MessageSummary {
+        .map(|(message_id, sender_canonical, size_bytes, received_at, state_flags)| MessageSummary {
             message_id,
             sender_canonical,
             size_bytes,
             received_at,
+            read: flag_from_state(&state_flags, "read"),
+            deleted: flag_from_state(&state_flags, "deleted"),
         })
         .collect())
+}
+
+/// Ajoute un événement au journal append-only (A02 §4.4/A21 §2.5) DANS une transaction déjà
+/// ouverte — jamais de contenu dans `payload` (API-5, A21-JRN-1), uniquement des IDs/booléens.
+/// Renvoie la séquence assignée : c'est l'autorité d'ordonnancement pour la LWW par champ côté
+/// client (A03-SYNC-1) — cette crate ne fait QUE l'assigner atomiquement, elle ne réconcilie
+/// aucun état client (aucun vault client n'existe dans ce dépôt, voir `SIMPLIFICATIONS.md`).
+async fn journal_append(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    principal_id: Uuid,
+    event_type: &str,
+    message_id: Option<Uuid>,
+    payload: &serde_json::Value,
+) -> Result<i64, StorageError> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO mail.journal (principal_id, event_type, message_id, payload)
+         VALUES ($1, $2, $3, $4)
+         RETURNING seq",
+    )
+    .bind(principal_id)
+    .bind(event_type)
+    .bind(message_id)
+    .bind(payload)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(row.0)
+}
+
+/// Delta de champs à appliquer via `POST /state/flags` (A04 §5.3/A04-EP-4bis) : `None` = champ
+/// non touché par cette requête (jamais "remis à false" par défaut). `deleted` participe à la
+/// MÊME discipline per-field LWW que `read` (A04-EP-4bis, v1.4) : c'est un booléen réversible,
+/// PAS l'action de purge/déplacement — voir [`purge_message`] pour `/state/delete`.
+#[derive(Default)]
+pub struct FlagsUpdate {
+    pub read: Option<bool>,
+    pub deleted: Option<bool>,
+}
+
+/// `POST /state/flags` (A04 §5.3) : applique un delta read/deleted à UN message et journalise
+/// l'événement `flags_changed` — dans la MÊME transaction (A18-ERR : pas d'état partiel visible
+/// entre la mise à jour et son entrée de journal). `principal_id` DOIT posséder le message
+/// (même discipline d'appartenance que `fetch_message_for_device`) — pas de mutation
+/// cross-principal. Renvoie la séquence de journal assignée (A04-EP-4 : "the response returns
+/// the assigned sequence").
+pub async fn apply_state_flags(
+    pool: &PgPool,
+    principal_id: Uuid,
+    message_id: Uuid,
+    update: &FlagsUpdate,
+) -> Result<i64, StorageError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT message_id FROM mail.messages WHERE message_id = $1 AND principal_id = $2 FOR UPDATE")
+        .bind(message_id)
+        .bind(principal_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StorageError::MessageNotFound(message_id))?;
+
+    let mut patch = serde_json::Map::new();
+    if let Some(read) = update.read {
+        patch.insert("read".to_string(), serde_json::json!(read));
+    }
+    if let Some(deleted) = update.deleted {
+        patch.insert("deleted".to_string(), serde_json::json!(deleted));
+    }
+    let patch_json = serde_json::Value::Object(patch);
+
+    sqlx::query("UPDATE mail.messages SET state_flags = state_flags || $1::jsonb WHERE message_id = $2")
+        .bind(&patch_json)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let seq = journal_append(&mut tx, principal_id, "flags_changed", Some(message_id), &patch_json).await?;
+    tx.commit().await?;
+    Ok(seq)
+}
+
+/// `POST /state/delete` (A04 §5.3), mode **hard** uniquement dans cette implémentation (A04
+/// v1.4 changelog : le Bridge, mono-dossier, n'exerce que la purge — voir `SIMPLIFICATIONS.md`
+/// pour le mode "soft"/déplacement vers Corbeille, non câblé ici). Purge : ligne `messages` +
+/// enveloppes + blobs (cascade FK `ON DELETE CASCADE`), événement `message_deleted` journalisé
+/// dans la MÊME transaction que la suppression catalogue (A02-DEL-1). Les objets de l'object
+/// store sont supprimés APRÈS le commit, avec vérification (A02-DEL-2) — un échec de suppression
+/// de fichier n'invalide pas la purge catalogue déjà actée (laissé au GC, esprit A02-FAIL-2),
+/// mais est loggué, jamais silencieux.
+pub async fn purge_message(
+    pool: &PgPool,
+    blob_store: &BlobStore,
+    principal_id: Uuid,
+    message_id: Uuid,
+) -> Result<i64, StorageError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT message_id FROM mail.messages WHERE message_id = $1 AND principal_id = $2 FOR UPDATE")
+        .bind(message_id)
+        .bind(principal_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StorageError::MessageNotFound(message_id))?;
+
+    let blob_keys: Vec<(String,)> = sqlx::query_as("SELECT object_key FROM mail.blobs WHERE message_id = $1")
+        .bind(message_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+    // FK ON DELETE CASCADE (A21 §2.3/2.4) : supprime blobs + enveloppes de ce message avec la ligne.
+    sqlx::query("DELETE FROM mail.messages WHERE message_id = $1")
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let payload = serde_json::json!({ "message_id": message_id });
+    let seq = journal_append(&mut tx, principal_id, "message_deleted", Some(message_id), &payload).await?;
+    tx.commit().await?;
+
+    for (object_key,) in blob_keys {
+        if let Err(e) = blob_store.delete(&object_key) {
+            tracing::warn!(
+                %object_key, error = %e,
+                "échec de suppression vérifiée du blob à la purge (A02-DEL-2) — laissé au GC, catalogue déjà purgé"
+            );
+        }
+    }
+    Ok(seq)
+}
+
+/// Résultat stocké d'une requête d'état déjà exécutée sous CETTE clé d'idempotence (A04-IDEM-1).
+pub struct IdempotentResult {
+    pub response_body: serde_json::Value,
+    pub journal_seq: i64,
+}
+
+/// Étape 1 d'une requête mutante (`/state/flags`/`/state/delete`) : la clé a-t-elle DÉJÀ été
+/// exécutée ? Si oui, l'appelant DOIT renvoyer ce résultat SANS ré-appliquer l'effet
+/// (A04-IDEM-1). Fenêtre de course connue (voir `SIMPLIFICATIONS.md`) : cette vérification et
+/// l'enregistrement ([`record_idempotency`]) ne sont pas atomiques ENTRE EUX — deux requêtes
+/// concurrentes sous la MÊME clé pourraient toutes deux passer ce contrôle avant que l'une des
+/// deux n'enregistre sa clé. Acceptable pour cette tranche (un Bridge IMAP séquentiel, pas un
+/// service exposé à une charge concurrente adversariale), documenté plutôt que caché.
+pub async fn check_idempotency(
+    pool: &PgPool,
+    idempotency_key: Uuid,
+) -> Result<Option<IdempotentResult>, StorageError> {
+    let row: Option<(serde_json::Value, i64)> = sqlx::query_as(
+        "SELECT response_body, journal_seq FROM mail.idempotency_keys WHERE idempotency_key = $1",
+    )
+    .bind(idempotency_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(response_body, journal_seq)| IdempotentResult { response_body, journal_seq }))
+}
+
+/// Étape 2 : enregistre le résultat de la PREMIÈRE exécution sous cette clé (A04-IDEM-1 : "the
+/// server MUST deduplicate"). `ON CONFLICT DO NOTHING` : si une course a fait gagner un autre
+/// appel concurrent (voir la note de [`check_idempotency`]), on ne réécrit jamais un résultat
+/// déjà posé — la première réponse enregistrée fait foi.
+pub async fn record_idempotency(
+    pool: &PgPool,
+    idempotency_key: Uuid,
+    principal_id: Uuid,
+    endpoint: &str,
+    response_body: &serde_json::Value,
+    journal_seq: i64,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO mail.idempotency_keys (idempotency_key, principal_id, endpoint, response_body, journal_seq)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (idempotency_key) DO NOTHING",
+    )
+    .bind(idempotency_key)
+    .bind(principal_id)
+    .bind(endpoint)
+    .bind(response_body)
+    .bind(journal_seq)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Vérifie qu'aucune ligne `mail.messages`/`mail.blobs` ne contient le clair d'origine

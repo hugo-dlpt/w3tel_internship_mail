@@ -13,23 +13,27 @@
 //! machine du client, jamais côté serveur.
 //!
 //! Périmètre volontairement réduit pour cette démo (voir `SIMPLIFICATIONS.md`) : une seule
-//! boîte INBOX, pas de flags/`\Seen`/multi-dossier, pas de STARTTLS, pas de SMTP/CalDAV, un
-//! seul compte préconfiguré (pas de mot de passe Bridge révocable par client, A20-CRED-1) — ce
-//! qui EST honoré en revanche : le Bridge est son PROPRE appareil enrôlé avec sa PROPRE AppKey
-//! Tier 2 (A20-CRED-4b/5), et le déchiffrement passe par le même chemin vérifié qu'A02/INV-8.
+//! boîte INBOX, pas de flags/`\Seen`/multi-dossier, pas de STARTTLS, pas de CalDAV, un seul
+//! compte préconfiguré (pas de mot de passe Bridge révocable par client, A20-CRED-1) — ce qui
+//! EST honoré en revanche : le Bridge est son PROPRE appareil enrôlé avec sa PROPRE AppKey
+//! Tier 2 (A20-CRED-4b/5), le déchiffrement passe par le même chemin vérifié qu'A02/INV-8, ET
+//! (nouveau) l'ENVOI SMTP (A20-SMTP-1) : le Bridge expose un second listener SMTP loopback-only
+//! et délègue TOUJOURS l'émission à `diamy-submitd` via `POST /submit` — il ne relaie jamais
+//! lui-même vers Internet (voir la section "SMTP (A20-SMTP-1)" plus bas dans ce fichier).
 #![forbid(unsafe_code)]
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use diamy_addr::{diamy_addr_canon, TenantAddressPolicy};
 use diamy_mail_crypto as crypto;
 use diamy_mail_iam::{DevIamClient, IamClient, Principal};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 /// A01-STAB-1 esprit (INV-15) : une ligne de commande IMAP anormalement longue est bornée,
 /// jamais une allocation illimitée — même discipline que `diamy-mxd::read_line_bounded`.
@@ -46,29 +50,45 @@ const MAX_LITERALS_PER_COMMAND: usize = 8;
 /// UIDVALIDITY fixe (V1 démo, pas de stockage persistant d'UID côté Bridge) — voir
 /// `SIMPLIFICATIONS.md` : un vrai Bridge devrait la garder stable entre sessions.
 const UID_VALIDITY: u32 = 1;
+/// Borne défensive (esprit A01-STAB-1 / INV-15) sur un corps SMTP `DATA` — même valeur par
+/// défaut que `diamy-mxd::DEFAULT_MAX_DATA_BYTES`.
+const MAX_SMTP_DATA_BYTES: usize = 10 * 1024 * 1024;
+const MAX_SMTP_RECIPIENTS: usize = 50;
 
 struct BridgeConfig {
     imap_bind_addr: SocketAddr,
+    /// A20-SMTP-1 : écoute SMTP locale du Bridge — MÊME règle de sécurité que l'IMAP
+    /// (A20-ARCH-2/NET-1/2/3), voir `smtp_bind_addr` dans `from_env` et son usage dans `main`.
+    smtp_bind_addr: SocketAddr,
     imap_user: String,
     imap_password: String,
     sync_base: String,
     app_key: String,
+    /// URL de `POST /submit` sur `diamy-submitd` (A20-SMTP-1 : le Bridge ne relaie JAMAIS
+    /// lui-même vers Internet — il délègue au chemin sortant natif, A10).
+    submit_url: String,
 }
 
 impl BridgeConfig {
     fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
-        let raw_addr =
-            std::env::var("DIAMY_BRIDGED_IMAP_ADDR").unwrap_or_else(|_| "127.0.0.1:1143".to_string());
-        // A20-NET-1 (non négociable) : on ne retient QUE le PORT de la valeur fournie — l'IP
-        // est TOUJOURS 127.0.0.1, câblée en dur ci-dessous. Aucune variable d'environnement,
-        // aucun flag ne permet d'élargir l'écoute à une interface routable.
-        let port: u16 = raw_addr
-            .rsplit(':')
-            .next()
-            .ok_or("DIAMY_BRIDGED_IMAP_ADDR invalide")?
-            .parse()?;
+        // A20-NET-1 (non négociable) : ces variables ne portent QUE le port — l'IP est
+        // TOUJOURS 127.0.0.1, câblée en dur ci-dessous. Aucune variable d'environnement, aucun
+        // flag ne permet d'élargir l'écoute à une interface routable. Une variable PAR port
+        // (plutôt qu'une adresse "ip:port" dont seul le port compterait) permet de lancer
+        // plusieurs instances du Bridge en parallèle — une par utilisateur de démo — chacune
+        // sur ses propres ports IMAP/SMTP (voir DEMO_GUIDE.md "Plusieurs comptes de démo").
+        let port: u16 = std::env::var("DIAMY_BRIDGED_IMAP_PORT")
+            .unwrap_or_else(|_| "1143".to_string())
+            .parse()
+            .map_err(|_| "DIAMY_BRIDGED_IMAP_PORT invalide (attendu un port numérique)")?;
+        let smtp_port: u16 = std::env::var("DIAMY_BRIDGED_SMTP_PORT")
+            .unwrap_or_else(|_| "1587".to_string())
+            .parse()
+            .map_err(|_| "DIAMY_BRIDGED_SMTP_PORT invalide (attendu un port numérique)")?;
+
         Ok(Self {
             imap_bind_addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            smtp_bind_addr: SocketAddr::from(([127, 0, 0, 1], smtp_port)),
             imap_user: std::env::var("DIAMY_BRIDGED_IMAP_USER")
                 .unwrap_or_else(|_| "hugo@w3.tel".to_string()),
             imap_password: std::env::var("DIAMY_BRIDGED_IMAP_PASSWORD")
@@ -76,9 +96,13 @@ impl BridgeConfig {
             sync_base: std::env::var("DIAMY_MAILD_SYNC_URL")
                 .unwrap_or_else(|_| "https://127.0.0.1:8443".to_string()),
             // A20-CRED-5 : AppKey Tier 2 PROPRE au Bridge, distincte de celle du client natif
-            // de test — doit correspondre à `DIAMY_MAILD_DEV_BRIDGE_APPKEY` côté `diamy-maild`.
+            // de test — doit correspondre à `DIAMY_MAILD_DEV_BRIDGE_APPKEY` côté `diamy-maild`
+            // ET à `DIAMY_SUBMITD_DEV_BRIDGE_APPKEY` côté `diamy-submitd` (MÊME valeur de
+            // secret, A20-CRED-5 : "MUST send it on every request to diamy-maild/diamy-submitd").
             app_key: std::env::var("DIAMY_MAILD_DEV_BRIDGE_APPKEY")
                 .unwrap_or_else(|_| "devonly_change_me_appkey_bridge_dev_client".to_string()),
+            submit_url: std::env::var("DIAMY_SUBMITD_SUBMIT_URL")
+                .unwrap_or_else(|_| "https://127.0.0.1:8446/submit".to_string()),
         })
     }
 }
@@ -141,6 +165,27 @@ struct MessageSummaryDto {
     #[allow(dead_code)]
     size_bytes: i64,
     received_at: Option<String>,
+    /// A04 §3/§5.3 : état réel serveur-autoritaire (`mail.messages.state_flags`), lu à CHAQUE
+    /// interrogation du catalogue (`fetch_mailbox_catalog`) — jamais un cache qui remplacerait
+    /// l'appel réseau (voir `cmd_store`/`cmd_expunge`).
+    #[serde(default)]
+    read: bool,
+    #[serde(default)]
+    deleted: bool,
+}
+
+/// Rendu IMAP des flags supportés par cette V1 (périmètre explicite : `\Seen`/`\Deleted`
+/// uniquement, voir `SIMPLIFICATIONS.md`) — factorisé pour FETCH FLAGS et les réponses FETCH
+/// non-SILENT de STORE, qui doivent afficher exactement la même chose.
+fn render_flags(read: bool, deleted: bool) -> String {
+    let mut parts = Vec::new();
+    if read {
+        parts.push("\\Seen");
+    }
+    if deleted {
+        parts.push("\\Deleted");
+    }
+    parts.join(" ")
 }
 
 #[derive(Deserialize)]
@@ -196,6 +241,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // discipline que `read_test_mail.rs`, voir SIMPLIFICATIONS.md).
         .danger_accept_invalid_certs(true)
         .build()?;
+
+    // A20-SMTP-1 : écoute SMTP locale du Bridge, MÊME discipline loopback-only que l'IMAP
+    // ci-dessus (A20-ARCH-2/NET-1/2) — bind puis re-vérification fail-closed AVANT de servir.
+    let smtp_listener = TcpListener::bind(config.smtp_bind_addr).await?;
+    let smtp_local_addr = smtp_listener.local_addr()?;
+    if !smtp_local_addr.ip().is_loopback() {
+        obs.events.with_label_values(&["diamy-bridged", "smtp_startup_refusal_nonloopback"]).inc();
+        return Err(format!(
+            "refus de démarrer le serveur SMTP (A20-NET-2) : {smtp_local_addr} n'est PAS une adresse loopback"
+        )
+        .into());
+    }
+    println!("== diamy-bridged : SMTP sur {smtp_local_addr} (loopback uniquement, A20-SMTP-1) ==");
+    tracing::info!(addr = %smtp_local_addr, "diamy-bridged : serveur SMTP démarré (loopback uniquement)");
+
+    {
+        let config = config.clone();
+        let http = http.clone();
+        let obs = obs.clone();
+        tokio::spawn(async move {
+            loop {
+                let (socket, peer) = match smtp_listener.accept().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "échec accept() SMTP");
+                        continue;
+                    }
+                };
+                // A20-NET-3 (défense en profondeur) : même vérification par-pair que l'IMAP.
+                if !peer.ip().is_loopback() {
+                    tracing::warn!(%peer, "connexion SMTP refusée : pair non-loopback (A20-NET-3)");
+                    obs.events.with_label_values(&["diamy-bridged", "smtp_nonloopback_peer_refusal"]).inc();
+                    drop(socket);
+                    continue;
+                }
+                obs.events.with_label_values(&["diamy-bridged", "smtp_session_started"]).inc();
+                let config = config.clone();
+                let http = http.clone();
+                let obs = obs.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_smtp_connection(socket, config, http, obs).await {
+                        tracing::warn!(%peer, error = %e, "session SMTP interrompue");
+                    }
+                });
+            }
+        });
+    }
 
     loop {
         let (socket, peer) = listener.accept().await?;
@@ -313,12 +405,16 @@ async fn handle_connection(
                 }
             }
             "FETCH" => cmd_fetch(&mut reader, &config, &http, &session, &tag, args, false).await?,
+            "STORE" => cmd_store(&mut reader, &config, &http, &mut session, &tag, args, false).await?,
+            "EXPUNGE" => cmd_expunge(&mut reader, &config, &http, &mut session, &tag).await?,
             "UID" => {
                 let mut uid_parts = args.splitn(2, char::is_whitespace);
                 let sub = uid_parts.next().unwrap_or("").to_ascii_uppercase();
                 let sub_args = uid_parts.next().unwrap_or("").trim();
                 if sub == "FETCH" {
                     cmd_fetch(&mut reader, &config, &http, &session, &tag, sub_args, true).await?
+                } else if sub == "STORE" {
+                    cmd_store(&mut reader, &config, &http, &mut session, &tag, sub_args, true).await?
                 } else {
                     format!("{tag} BAD sous-commande UID non supportée\r\n")
                 }
@@ -389,6 +485,33 @@ fn tokenize_args(s: &str) -> Vec<String> {
     out
 }
 
+/// Authentifie le compte de démo préconfiguré et charge tout ce qu'il faut pour parler à
+/// `diamy-maild`/`diamy-submitd` comme un vrai appareil (A20-ARCH-1) — factorisé pour être
+/// PARTAGÉ entre `LOGIN` (IMAP) et `AUTH` (SMTP, A20-SMTP-1) : les deux protocoles
+/// authentifient le MÊME compte de démo unique (A20-CRED-1 simplifié, voir SIMPLIFICATIONS.md).
+fn authenticate_bridge_account(config: &BridgeConfig, user: &str, pass: &str) -> Result<AuthedSession, String> {
+    // A20-CRED-1 (simplifié, documenté) : un seul compte préconfiguré, PAS un mot de passe
+    // Bridge révocable par client — voir SIMPLIFICATIONS.md.
+    if user != config.imap_user || pass != config.imap_password {
+        return Err("identifiants invalides".to_string());
+    }
+
+    let iam = DevIamClient::seeded();
+    let canonical =
+        diamy_addr_canon(user, TenantAddressPolicy::default()).map_err(|e| format!("adresse invalide : {e}"))?;
+    let principal = iam
+        .resolve_principal(canonical.as_str())
+        .map_err(|_| "principal introuvable".to_string())?;
+
+    let secret_path = bridge_dev_secret_path(canonical.as_str());
+    let (device_id, device_sec) =
+        load_device_secret(&secret_path).map_err(|e| format!("clé de l'appareil Bridge introuvable : {e}"))?;
+
+    let mail_plane_token = load_fixture_mail_plane_token(principal.id).map_err(|e| e.to_string())?;
+
+    Ok(AuthedSession { principal, device_id, device_sec, mail_plane_token })
+}
+
 async fn cmd_login<S>(
     reader: &mut BufReader<S>,
     config: &BridgeConfig,
@@ -408,35 +531,13 @@ where
         return Ok(format!("{tag} BAD LOGIN requiert utilisateur et mot de passe\r\n"));
     };
 
-    // A20-CRED-1 (simplifié, documenté) : un seul compte préconfiguré, PAS un mot de passe
-    // Bridge révocable par client — voir SIMPLIFICATIONS.md.
-    if user != &config.imap_user || pass != &config.imap_password {
-        return Ok(format!("{tag} NO identifiants invalides\r\n"));
+    match authenticate_bridge_account(config, user, pass) {
+        Ok(authed) => {
+            session.authed = Some(authed);
+            Ok(format!("{tag} OK LOGIN completed\r\n"))
+        }
+        Err(e) => Ok(format!("{tag} NO {e}\r\n")),
     }
-
-    let iam = DevIamClient::seeded();
-    let canonical = match diamy_addr_canon(user, TenantAddressPolicy::default()) {
-        Ok(c) => c,
-        Err(e) => return Ok(format!("{tag} NO adresse invalide : {e}\r\n")),
-    };
-    let principal = match iam.resolve_principal(canonical.as_str()) {
-        Ok(p) => p,
-        Err(_) => return Ok(format!("{tag} NO principal introuvable\r\n")),
-    };
-
-    let secret_path = bridge_dev_secret_path(canonical.as_str());
-    let (device_id, device_sec) = match load_device_secret(&secret_path) {
-        Ok(v) => v,
-        Err(e) => return Ok(format!("{tag} NO clé de l'appareil Bridge introuvable : {e}\r\n")),
-    };
-
-    let mail_plane_token = match load_fixture_mail_plane_token(principal.id) {
-        Ok(t) => t,
-        Err(e) => return Ok(format!("{tag} NO jeton mail-plane indisponible : {e}\r\n")),
-    };
-
-    session.authed = Some(AuthedSession { principal, device_id, device_sec, mail_plane_token });
-    Ok(format!("{tag} OK LOGIN completed\r\n"))
 }
 
 fn auth_headers(builder: reqwest::RequestBuilder, config: &BridgeConfig, token: &str) -> reqwest::RequestBuilder {
@@ -523,11 +624,13 @@ where
 
     write_logged(reader, &format!("* {count} EXISTS\r\n")).await?;
     write_logged(reader, "* 0 RECENT\r\n").await?;
-    write_logged(reader, "* FLAGS ()\r\n").await?;
-    write_logged(reader, "* OK [PERMANENTFLAGS ()] pas d'ecriture (V1 demo)\r\n").await?;
+    // A04 §5.3/§6 réel désormais câblé (STORE/EXPUNGE) : \Seen/\Deleted sont de VRAIS flags
+    // persistés côté serveur (mail.messages.state_flags), plus un stand-in en lecture seule.
+    write_logged(reader, "* FLAGS (\\Seen \\Deleted)\r\n").await?;
+    write_logged(reader, "* OK [PERMANENTFLAGS (\\Seen \\Deleted)] flags reels (A04 §5.3)\r\n").await?;
     write_logged(reader, &format!("* OK [UIDVALIDITY {UID_VALIDITY}]\r\n")).await?;
     write_logged(reader, &format!("* OK [UIDNEXT {}]\r\n", count + 1)).await?;
-    Ok(format!("{tag} OK [READ-ONLY] SELECT completed\r\n"))
+    Ok(format!("{tag} OK [READ-WRITE] SELECT completed\r\n"))
 }
 
 /// `STATUS INBOX (MESSAGES UIDNEXT ...)` — comme `SELECT`, interroge diamy-maild à CHAQUE
@@ -564,6 +667,10 @@ where
     };
     let count = numbered.len() as u32;
 
+    // A04 §3/§5.3 réel : UNSEEN reflète maintenant l'état SERVEUR (mail.messages.state_flags),
+    // pas une valeur figée — recalculé à chaque STATUS depuis le catalogue fraîchement tiré.
+    let unseen_count = numbered.iter().filter(|(_, m)| !m.read).count() as u32;
+
     let requested = items_raw.trim_start_matches('(').trim_end_matches(')');
     let mut parts: Vec<String> = Vec::new();
     for tok in requested.split_whitespace() {
@@ -572,9 +679,7 @@ where
             "RECENT" => parts.push("RECENT 0".to_string()),
             "UIDNEXT" => parts.push(format!("UIDNEXT {}", count + 1)),
             "UIDVALIDITY" => parts.push(format!("UIDVALIDITY {UID_VALIDITY}")),
-            // V1 démo : aucun flag \Seen n'est jamais posé (lecture seule, pas de
-            // persistance d'état) — tout message est donc "non lu" du point de vue du Bridge.
-            "UNSEEN" => parts.push(format!("UNSEEN {count}")),
+            "UNSEEN" => parts.push(format!("UNSEEN {unseen_count}")),
             _ => {}
         }
     }
@@ -1016,7 +1121,7 @@ where
         for item in &items {
             match item {
                 FetchItem::Uid => attrs.push(format!("UID {uid}")),
-                FetchItem::Flags => attrs.push("FLAGS ()".to_string()),
+                FetchItem::Flags => attrs.push(format!("FLAGS ({})", render_flags(summary.read, summary.deleted))),
                 FetchItem::InternalDate => attrs.push(format!("INTERNALDATE {}", imap_quote(&decrypted.date))),
                 FetchItem::Rfc822Size => attrs.push(format!("RFC822.SIZE {}", rfc5322.len())),
                 FetchItem::Envelope => attrs.push(format!(
@@ -1079,6 +1184,265 @@ where
     }
 
     Ok(format!("{tag} OK {} completed\r\n", if is_uid { "UID FETCH" } else { "FETCH" }))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StoreMode {
+    Set,
+    Add,
+    Remove,
+}
+
+/// Parse `STORE`/`UID STORE`'s arguments : `<set> <[+/-]FLAGS[.SILENT]> <flag-list>`. Le
+/// grammaire RFC 3501 §9 autorise la liste de flags SOIT entre parenthèses SOIT nue
+/// (espace-séparée) — les deux formes sont acceptées ici (Postel's law côté serveur, même
+/// esprit que `parse_fetch_items`).
+fn parse_store_args(args: &str) -> Option<(String, StoreMode, bool, Vec<String>)> {
+    let mut top = args.splitn(3, char::is_whitespace);
+    let set_spec = top.next()?.to_string();
+    let item = top.next()?;
+    let rest = top.next().unwrap_or("").trim();
+
+    let item_upper = item.to_ascii_uppercase();
+    let (mode, base): (StoreMode, &str) = if let Some(b) = item_upper.strip_prefix('+') {
+        (StoreMode::Add, b)
+    } else if let Some(b) = item_upper.strip_prefix('-') {
+        (StoreMode::Remove, b)
+    } else {
+        (StoreMode::Set, item_upper.as_str())
+    };
+    let base = base.strip_suffix(".SILENT").unwrap_or(base);
+    let silent = item_upper.ends_with(".SILENT");
+    if base != "FLAGS" {
+        return None;
+    }
+    let flags_str = rest.trim_start_matches('(').trim_end_matches(')');
+    let flags = flags_str.split_whitespace().map(|s| s.to_string()).collect();
+    Some((set_spec, mode, silent, flags))
+}
+
+/// `STORE`/`UID STORE` (RFC 3501 §6.4.6) — périmètre EXPLICITE de cette tranche : seuls
+/// `\Seen`/`\Deleted` sont reconnus (voir `SIMPLIFICATIONS.md`) ; tout autre flag dans la liste
+/// du client est syntaxiquement accepté mais ignoré (Postel's law), jamais une erreur bloquante.
+///
+/// CHAQUE message affecté déclenche un VRAI appel réseau `POST /state/flags` avec une clé
+/// d'idempotence FRAÎCHE (UUIDv7, A04-IDEM-1) — jamais un cache local qui remplacerait cet
+/// appel (exigence explicite de cette tranche) : c'est ce qui rend le flag visible depuis une
+/// AUTRE session/connexion IMAP sur le même principal (A04 §3, preuve du test multi-connexion).
+#[allow(clippy::too_many_arguments)]
+async fn cmd_store<S>(
+    reader: &mut BufReader<S>,
+    config: &BridgeConfig,
+    http: &reqwest::Client,
+    session: &mut Session,
+    tag: &str,
+    args: &str,
+    is_uid: bool,
+) -> std::io::Result<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Some(authed) = &session.authed else {
+        return Ok(format!("{tag} NO not authenticated\r\n"));
+    };
+    let Some(mailbox) = &mut session.mailbox else {
+        return Ok(format!("{tag} NO aucune boite selectionnee\r\n"));
+    };
+
+    let Some((set_spec, mode, silent, flags)) = parse_store_args(args) else {
+        return Ok(format!("{tag} BAD STORE : arguments invalides\r\n"));
+    };
+    let wants_seen = flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen"));
+    let wants_deleted = flags.iter().any(|f| f.eq_ignore_ascii_case("\\Deleted"));
+    if !wants_seen && !wants_deleted {
+        // Aucun flag reconnu dans cette V1 (\Seen/\Deleted uniquement) : rien à envoyer au
+        // serveur, mais ce n'est pas une erreur (Postel's law) — juste un STORE sans effet ici.
+        return Ok(format!("{tag} OK {} completed\r\n", if is_uid { "UID STORE" } else { "STORE" }));
+    }
+
+    let count = mailbox.messages.len() as u32;
+    let selected_numbers = parse_number_set(&set_spec, count);
+
+    let mut fetch_lines: Vec<String> = Vec::new();
+    for n in selected_numbers {
+        let idx = if is_uid {
+            mailbox.messages.iter().position(|(u, _)| *u == n)
+        } else if n >= 1 && n <= count {
+            Some((n - 1) as usize)
+        } else {
+            None
+        };
+        let Some(idx) = idx else { continue };
+        let (uid, summary) = mailbox.messages[idx].clone();
+        let seq = (idx + 1) as u32;
+
+        let new_read = match mode {
+            StoreMode::Set => wants_seen,
+            StoreMode::Add => summary.read || wants_seen,
+            StoreMode::Remove => {
+                if wants_seen {
+                    false
+                } else {
+                    summary.read
+                }
+            }
+        };
+        let new_deleted = match mode {
+            StoreMode::Set => wants_deleted,
+            StoreMode::Add => summary.deleted || wants_deleted,
+            StoreMode::Remove => {
+                if wants_deleted {
+                    false
+                } else {
+                    summary.deleted
+                }
+            }
+        };
+
+        // A04-IDEM-1 : une clé FRAÎCHE par requête mutante — jamais réutilisée entre messages
+        // ni entre commandes, sinon le serveur dédupliquerait à tort des mutations distinctes.
+        let idempotency_key = Uuid::now_v7();
+        let mut body = serde_json::Map::new();
+        body.insert("message_id".to_string(), serde_json::json!(summary.message_id));
+        body.insert("idempotency_key".to_string(), serde_json::json!(idempotency_key));
+        // Seul le champ EFFECTIVEMENT demandé par le client est envoyé (A04-EP-4bis : delta
+        // par champ, jamais un "remise à false" implicite du champ non concerné).
+        if wants_seen {
+            body.insert("read".to_string(), serde_json::json!(new_read));
+        }
+        if wants_deleted {
+            body.insert("deleted".to_string(), serde_json::json!(new_deleted));
+        }
+
+        let url = format!(
+            "{}/v1/mailbox/{}/state/flags",
+            config.sync_base, authed.principal.id
+        );
+        let resp = auth_headers(http.post(&url), config, &authed.mail_plane_token)
+            .json(&serde_json::Value::Object(body))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::debug!(message_id = %summary.message_id, %new_read, %new_deleted, "STORE : /state/flags applique");
+            }
+            Ok(r) => {
+                tracing::warn!(status = %r.status(), message_id = %summary.message_id, "STORE : echec /state/flags, message inchange");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, message_id = %summary.message_id, "STORE : echec reseau /state/flags, message inchange");
+                continue;
+            }
+        }
+
+        // Le mutation a été acceptée par le serveur : on met à jour le cache de SESSION (pas un
+        // remplacement de l'appel réseau, juste la cohérence immédiate pour un EXPUNGE/FETCH
+        // FLAGS qui suivrait sans NOOP/SELECT intermédiaire).
+        mailbox.messages[idx].1.read = new_read;
+        mailbox.messages[idx].1.deleted = new_deleted;
+
+        if !silent {
+            let flags_rendered = render_flags(new_read, new_deleted);
+            let attrs = if is_uid {
+                format!("UID {uid} FLAGS ({flags_rendered})")
+            } else {
+                format!("FLAGS ({flags_rendered})")
+            };
+            fetch_lines.push(format!("* {seq} FETCH ({attrs})\r\n"));
+        }
+    }
+
+    for line in &fetch_lines {
+        write_logged(reader, line).await?;
+    }
+    Ok(format!("{tag} OK {} completed\r\n", if is_uid { "UID STORE" } else { "STORE" }))
+}
+
+/// `EXPUNGE` (RFC 3501 §6.4.3) — purge (mode `"hard"`, A04 v1.4 changelog) chaque message
+/// `\Deleted` de la boîte SÉLECTIONNÉE via un VRAI appel réseau `POST /state/delete`, puis émet
+/// les réponses non taguées `* n EXPUNGE` requises. Numérotation : RFC 3501 exige qu'après
+/// chaque EXPUNGE annoncé dans la MÊME commande, les numéros de séquence suivants soient déjà
+/// décrémentés comme si ce message avait disparu — on traite donc du plus petit au plus grand
+/// numéro ORIGINAL et on décrémente par le compte déjà annoncé (`i` ci-dessous), jamais le
+/// numéro brut.
+async fn cmd_expunge<S>(
+    reader: &mut BufReader<S>,
+    config: &BridgeConfig,
+    http: &reqwest::Client,
+    session: &mut Session,
+    tag: &str,
+) -> std::io::Result<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Some(authed) = &session.authed else {
+        return Ok(format!("{tag} NO not authenticated\r\n"));
+    };
+    let Some(mailbox) = &mut session.mailbox else {
+        return Ok(format!("{tag} NO aucune boite selectionnee\r\n"));
+    };
+
+    // Numéros de séquence ORIGINAUX (avant toute décrémentation) des messages \Deleted, dans
+    // l'ordre croissant (le Vec est déjà trié chronologiquement ascendant, uid == position ici).
+    // La suppression est une opération de métadonnée liée au PRINCIPAL (A21 §2.2), pas à
+    // l'appareil — aucun `device_id` n'est nécessaire dans le corps de `/state/delete`.
+    let to_expunge: Vec<(usize, Uuid)> = mailbox
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, m))| m.deleted)
+        .map(|(idx, (_, m))| (idx, m.message_id))
+        .collect();
+
+    let mut expunged_indices = Vec::new();
+    let mut lines = Vec::new();
+    for (i, (idx, message_id)) in to_expunge.iter().enumerate() {
+        let idempotency_key = Uuid::now_v7();
+        let body = serde_json::json!({
+            "message_id": message_id,
+            "idempotency_key": idempotency_key,
+            "mode": "hard",
+        });
+        let url = format!(
+            "{}/v1/mailbox/{}/state/delete",
+            config.sync_base, authed.principal.id
+        );
+        let resp = auth_headers(http.post(&url), config, &authed.mail_plane_token)
+            .json(&body)
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::debug!(%message_id, "EXPUNGE : /state/delete (hard) applique");
+            }
+            Ok(r) => {
+                tracing::warn!(status = %r.status(), %message_id, "EXPUNGE : echec /state/delete, message conserve");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, %message_id, "EXPUNGE : echec reseau /state/delete, message conserve");
+                continue;
+            }
+        }
+        let original_seq = (*idx + 1) as u32;
+        // Décrémenté par le nombre d'EXPUNGE DÉJÀ annoncés dans cette même commande (RFC 3501
+        // §7.4.1 : chaque suppression décale immédiatement les numéros de séquence suivants).
+        let adjusted_seq = original_seq - i as u32;
+        lines.push(format!("* {adjusted_seq} EXPUNGE\r\n"));
+        expunged_indices.push(*idx);
+    }
+
+    // Retire les entrées purgées du cache de session, du plus grand index au plus petit pour ne
+    // pas invalider les index restants pendant la suppression.
+    for idx in expunged_indices.iter().rev() {
+        mailbox.messages.remove(*idx);
+    }
+
+    for line in &lines {
+        write_logged(reader, line).await?;
+    }
+    Ok(format!("{tag} OK EXPUNGE completed\r\n"))
 }
 
 enum LineRead {
@@ -1223,6 +1587,345 @@ where
     }
 }
 
+// ===========================================================================================
+// SMTP (A20-SMTP-1) — le Bridge présente un point de soumission SMTP local, et relaie TOUJOURS
+// via `diamy-submitd` (A04 `/submit` → A10) : "The Bridge does not bypass A10" (A20-SMTP-1).
+// Jamais de relais SMTP direct vers Internet depuis ce processus — voir la doc de module de
+// `diamy-submitd` pour la décision d'architecture précise (pas devinée, lue dans A20/A10/A23).
+// ===========================================================================================
+
+/// Extrait l'adresse entre `<` et `>` d'une commande `MAIL FROM:<...>` / `RCPT TO:<...>` —
+/// même logique que `diamy-mxd::extract_addr` (fichier différent, mêmes règles SMTP).
+fn extract_addr(line: &str) -> Option<String> {
+    let start = line.find('<')?;
+    let end = line[start..].find('>')? + start;
+    let addr = line[start + 1..end].trim();
+    if addr.is_empty() {
+        None
+    } else {
+        Some(addr.to_string())
+    }
+}
+
+struct SmtpSession {
+    authed: Option<AuthedSession>,
+    mail_from: Option<String>,
+    rcpt_to: Vec<String>,
+}
+
+/// Sessions non-authentifiées : borne défensive sur `MAIL FROM`/`RCPT TO` avant `AUTH` réussi,
+/// pour ne jamais laisser une commande non bornée s'accumuler côté serveur (esprit INV-15).
+fn require_auth(session: &SmtpSession) -> Option<&'static str> {
+    if session.authed.is_none() {
+        Some("530 authentification requise\r\n")
+    } else {
+        None
+    }
+}
+
+async fn handle_smtp_connection(
+    socket: TcpStream,
+    config: Arc<BridgeConfig>,
+    http: reqwest::Client,
+    obs: Arc<diamy_obs::Obs>,
+) -> std::io::Result<()> {
+    let mut reader = BufReader::new(socket);
+    reader.get_mut().write_all(b"220 diamy-bridged ESMTP pret (A20-SMTP, demo)\r\n").await?;
+
+    let mut session = SmtpSession { authed: None, mail_from: None, rcpt_to: Vec::new() };
+
+    loop {
+        let line = match read_line_bounded(&mut reader).await? {
+            LineRead::Eof => return Ok(()),
+            LineRead::TooLong => {
+                reader.get_mut().write_all(b"500 ligne trop longue\r\n").await?;
+                continue;
+            }
+            LineRead::Line(l) => l,
+        };
+        let upper = line.to_ascii_uppercase();
+        tracing::debug!(command = %upper.split_whitespace().next().unwrap_or(""), "commande SMTP recue");
+
+        if upper.starts_with("EHLO") || upper.starts_with("HELO") {
+            reader
+                .get_mut()
+                .write_all(b"250-diamy-bridged\r\n250-AUTH LOGIN PLAIN\r\n250 SIZE 10485760\r\n")
+                .await?;
+        } else if upper.starts_with("AUTH LOGIN") {
+            cmd_auth_login(&mut reader, &config, &mut session).await?;
+        } else if upper.starts_with("AUTH PLAIN") {
+            cmd_auth_plain(&mut reader, &config, &mut session, line.trim_end()).await?;
+        } else if upper.starts_with("MAIL FROM:") {
+            if let Some(msg) = require_auth(&session) {
+                reader.get_mut().write_all(msg.as_bytes()).await?;
+                continue;
+            }
+            match extract_addr(&line) {
+                Some(addr) => {
+                    session.mail_from = Some(addr);
+                    session.rcpt_to.clear();
+                    reader.get_mut().write_all(b"250 OK\r\n").await?;
+                }
+                None => reader.get_mut().write_all(b"501 syntaxe MAIL FROM invalide\r\n").await?,
+            }
+        } else if upper.starts_with("RCPT TO:") {
+            if let Some(msg) = require_auth(&session) {
+                reader.get_mut().write_all(msg.as_bytes()).await?;
+                continue;
+            }
+            if session.mail_from.is_none() {
+                reader.get_mut().write_all(b"503 MAIL FROM requis avant RCPT TO\r\n").await?;
+                continue;
+            }
+            if session.rcpt_to.len() >= MAX_SMTP_RECIPIENTS {
+                reader.get_mut().write_all(b"452 trop de destinataires\r\n").await?;
+                continue;
+            }
+            match extract_addr(&line).and_then(|raw| {
+                diamy_addr_canon(&raw, TenantAddressPolicy::default()).ok().map(|c| c.as_str().to_string())
+            }) {
+                Some(canonical) => {
+                    session.rcpt_to.push(canonical);
+                    reader.get_mut().write_all(b"250 OK\r\n").await?;
+                }
+                None => reader.get_mut().write_all(b"501 adresse destinataire invalide\r\n").await?,
+            }
+        } else if upper.starts_with("DATA") {
+            if let Some(msg) = require_auth(&session) {
+                reader.get_mut().write_all(msg.as_bytes()).await?;
+                continue;
+            }
+            if session.rcpt_to.is_empty() {
+                reader.get_mut().write_all(b"554 aucun destinataire valide\r\n").await?;
+                continue;
+            }
+            reader.get_mut().write_all(b"354 Terminez par <CRLF>.<CRLF>\r\n").await?;
+            let read = read_smtp_data_bounded(&mut reader).await?;
+            match read {
+                SmtpDataOutcome::TooLarge => {
+                    reader.get_mut().write_all(b"552 message trop volumineux\r\n").await?;
+                }
+                SmtpDataOutcome::Body(mut raw_message) => {
+                    obs.events.with_label_values(&["diamy-bridged", "smtp_submit_attempt"]).inc();
+                    // INV-21 : jamais le contenu dans les logs — seulement des métadonnées.
+                    tracing::info!(
+                        recipients = session.rcpt_to.len(),
+                        size_bytes = raw_message.len(),
+                        "soumission SMTP recue, transmission a diamy-submitd (A10, pas de relais direct)"
+                    );
+                    let authed = session.authed.as_ref().expect("verifie par require_auth ci-dessus");
+                    let mail_from = session.mail_from.clone().unwrap_or_default();
+                    let outcome =
+                        submit_via_diamy_submitd(&config, &http, authed, &mail_from, &session.rcpt_to, &raw_message)
+                            .await;
+                    raw_message.zeroize(); // A10-EMIT-1 esprit : le clair d'émission ne survit pas au-delà de l'usage
+                    match outcome {
+                        Ok(true) => {
+                            obs.events.with_label_values(&["diamy-bridged", "smtp_submit_accepted"]).inc();
+                            reader.get_mut().write_all(b"250 message accepte pour relais (A10)\r\n").await?;
+                        }
+                        Ok(false) => {
+                            obs.events.with_label_values(&["diamy-bridged", "smtp_submit_rejected"]).inc();
+                            reader.get_mut().write_all(b"554 echec du relais pour tous les destinataires\r\n").await?;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "echec de la soumission vers diamy-submitd");
+                            obs.events.with_label_values(&["diamy-bridged", "smtp_submit_error"]).inc();
+                            reader
+                                .get_mut()
+                                .write_all(b"451 echec temporaire : diamy-submitd injoignable, reessayez\r\n")
+                                .await?;
+                        }
+                    }
+                }
+            }
+            session.mail_from = None;
+            session.rcpt_to.clear();
+        } else if upper.starts_with("RSET") {
+            session.mail_from = None;
+            session.rcpt_to.clear();
+            reader.get_mut().write_all(b"250 OK\r\n").await?;
+        } else if upper.starts_with("NOOP") {
+            reader.get_mut().write_all(b"250 OK\r\n").await?;
+        } else if upper.starts_with("QUIT") {
+            reader.get_mut().write_all(b"221 au revoir\r\n").await?;
+            return Ok(());
+        } else {
+            reader.get_mut().write_all(b"500 commande non reconnue\r\n").await?;
+        }
+    }
+}
+
+async fn cmd_auth_login<S>(
+    reader: &mut BufReader<S>,
+    config: &BridgeConfig,
+    session: &mut SmtpSession,
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    reader.get_mut().write_all(b"334 VXNlcm5hbWU6\r\n").await?; // "Username:"
+    let user_b64 = match read_line_bounded(reader).await? {
+        LineRead::Line(l) => l,
+        _ => {
+            reader.get_mut().write_all(b"501 authentification interrompue\r\n").await?;
+            return Ok(());
+        }
+    };
+    reader.get_mut().write_all(b"334 UGFzc3dvcmQ6\r\n").await?; // "Password:"
+    let pass_b64 = match read_line_bounded(reader).await? {
+        LineRead::Line(l) => l,
+        _ => {
+            reader.get_mut().write_all(b"501 authentification interrompue\r\n").await?;
+            return Ok(());
+        }
+    };
+
+    let (Ok(user_bytes), Ok(pass_bytes)) = (STANDARD.decode(user_b64.trim()), STANDARD.decode(pass_b64.trim()))
+    else {
+        reader.get_mut().write_all(b"501 base64 invalide\r\n").await?;
+        return Ok(());
+    };
+    let user = String::from_utf8_lossy(&user_bytes).to_string();
+    let pass = String::from_utf8_lossy(&pass_bytes).to_string();
+
+    match authenticate_bridge_account(config, &user, &pass) {
+        Ok(authed) => {
+            session.authed = Some(authed);
+            reader.get_mut().write_all(b"235 authentification reussie\r\n").await?;
+        }
+        Err(_) => reader.get_mut().write_all(b"535 identifiants invalides\r\n").await?,
+    }
+    Ok(())
+}
+
+async fn cmd_auth_plain<S>(
+    reader: &mut BufReader<S>,
+    config: &BridgeConfig,
+    session: &mut SmtpSession,
+    line: &str,
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // Deux formes valides (RFC 4954) : `AUTH PLAIN <b64>` en une ligne, ou `AUTH PLAIN` seul
+    // suivi d'un défi `334 ` puis du `<b64>` sur la ligne suivante.
+    let inline_b64 = line.splitn(3, char::is_whitespace).nth(2);
+    let b64 = match inline_b64 {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => {
+            reader.get_mut().write_all(b"334 \r\n").await?;
+            match read_line_bounded(reader).await? {
+                LineRead::Line(l) => l,
+                _ => {
+                    reader.get_mut().write_all(b"501 authentification interrompue\r\n").await?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    let Ok(decoded) = STANDARD.decode(b64.trim()) else {
+        reader.get_mut().write_all(b"501 base64 invalide\r\n").await?;
+        return Ok(());
+    };
+    // RFC 4954 : `\0authzid\0authcid\0password` — on ignore `authzid`, on utilise `authcid`.
+    let parts: Vec<&[u8]> = decoded.split(|b| *b == 0).collect();
+    let Some((user_bytes, pass_bytes)) = parts.get(1).zip(parts.get(2)) else {
+        reader.get_mut().write_all(b"501 format AUTH PLAIN invalide\r\n").await?;
+        return Ok(());
+    };
+    let user = String::from_utf8_lossy(user_bytes).to_string();
+    let pass = String::from_utf8_lossy(pass_bytes).to_string();
+
+    match authenticate_bridge_account(config, &user, &pass) {
+        Ok(authed) => {
+            session.authed = Some(authed);
+            reader.get_mut().write_all(b"235 authentification reussie\r\n").await?;
+        }
+        Err(_) => reader.get_mut().write_all(b"535 identifiants invalides\r\n").await?,
+    }
+    Ok(())
+}
+
+enum SmtpDataOutcome {
+    Body(Vec<u8>),
+    TooLarge,
+}
+
+/// Lit le corps `DATA` jusqu'au terminateur `<CRLF>.<CRLF>`, dot-unstuffing compris — même
+/// discipline de borne que `diamy-mxd::read_data_bounded` (INV-15 : jamais une allocation
+/// illimitée, même face à une seule ligne géante sans retour à la ligne).
+async fn read_smtp_data_bounded<S>(reader: &mut BufReader<S>) -> std::io::Result<SmtpDataOutcome>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut body = Vec::new();
+    let mut too_large = false;
+    loop {
+        let (content, line_too_long) = match read_line_bounded(reader).await? {
+            LineRead::Eof => break,
+            LineRead::TooLong => (String::new(), true),
+            LineRead::Line(l) => (l, false),
+        };
+        if !line_too_long && content == "." {
+            break;
+        }
+        too_large |= line_too_long;
+        let unstuffed = content.strip_prefix('.').filter(|_| content.starts_with("..")).unwrap_or(&content);
+        if !too_large {
+            if body.len() + unstuffed.len() + 1 > MAX_SMTP_DATA_BYTES {
+                too_large = true;
+            } else {
+                body.extend_from_slice(unstuffed.as_bytes());
+                body.push(b'\n');
+            }
+        }
+    }
+    if too_large {
+        body.zeroize();
+        Ok(SmtpDataOutcome::TooLarge)
+    } else {
+        Ok(SmtpDataOutcome::Body(body))
+    }
+}
+
+#[derive(Serialize)]
+struct SubmitRequestBody<'a> {
+    mail_from: &'a str,
+    rcpt_to: &'a [String],
+    message_b64: String,
+}
+
+#[derive(Deserialize)]
+struct SubmitResponseBody {
+    accepted: bool,
+}
+
+/// A20-SMTP-1 : transmet la soumission à `diamy-submitd` via `POST /submit` — le Bridge ne
+/// parle JAMAIS SMTP sortant lui-même vers un destinataire réel (A10 n'est pas contourné).
+/// Retourne `Ok(true)` si `diamy-submitd` a accepté (au moins un destinataire relayé),
+/// `Ok(false)` s'il a répondu mais rejeté tous les destinataires, `Err` sur échec réseau/HTTP.
+async fn submit_via_diamy_submitd(
+    config: &BridgeConfig,
+    http: &reqwest::Client,
+    authed: &AuthedSession,
+    mail_from: &str,
+    rcpt_to: &[String],
+    raw_message: &[u8],
+) -> Result<bool, String> {
+    let body = SubmitRequestBody { mail_from, rcpt_to, message_b64: STANDARD.encode(raw_message) };
+    let resp = auth_headers(http.post(&config.submit_url), config, &authed.mail_plane_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("requete /submit echouee : {e}"))?;
+    let status = resp.status();
+    let parsed: SubmitResponseBody =
+        resp.json().await.map_err(|e| format!("reponse /submit invalide (status {status}) : {e}"))?;
+    Ok(parsed.accepted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1340,5 +2043,654 @@ mod tests {
         // l'entrée d'origine ressort telle quelle si le format ne correspond pas.
         assert_eq!(to_rfc2822_date("n'importe quoi"), "n'importe quoi");
         assert_eq!(to_rfc2822_date(""), "");
+    }
+}
+
+/// Round-trip complet du chemin SORTANT (A20-SMTP-1 / A10, tranche démo) : un VRAI client SMTP
+/// parle au VRAI serveur SMTP du Bridge (`handle_smtp_connection`, ce fichier) ; le Bridge
+/// relaie via le VRAI routeur HTTPS de `diamy-submitd` (en-process, `diamy_submitd::router`,
+/// dépendance de test sur la librairie du service — voir `Cargo.toml`) ; `diamy-submitd` relaie
+/// via un VRAI dialogue SMTP (`relay.rs`) vers un VRAI processus `diamy-mxd` séparé (subprocess
+/// du binaire déjà compilé — **AUCUNE modification du code de `diamy-mxd`**, conformément au
+/// périmètre demandé) ; la réception est vérifiée en lisant DIRECTEMENT le même Postgres via
+/// `diamy-mail-storage` et en déchiffrant avec la clé d'un appareil destinataire enrôlé par ce
+/// test — même chemin de vérification (AAD, `unwrap_key`/`open_message`) que le reste du projet.
+///
+/// Prérequis (comme les autres tests d'intégration du dépôt, voir `SIMPLIFICATIONS.md`) :
+/// Postgres de dev actif (`docker compose up`) ET `diamy-mxd` déjà compilé
+/// (`cargo build --workspace` ou `cargo build -p diamy-mxd` au préalable — `cargo test
+/// --workspace` le fait déjà en tant qu'effet de bord de la construction du workspace).
+#[cfg(test)]
+mod smtp_roundtrip_tests {
+    use super::*;
+    use diamy_mail_storage as storage;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::BufReader as TokioBufReader;
+
+    fn test_database_url() -> String {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://diamy:devonly_change_me@localhost:5433/diamymail".to_string())
+    }
+
+    /// Port libre choisi par l'OS, immédiatement relâché — même technique de test qu'ailleurs
+    /// dans le projet (`127.0.0.1:0`), nécessaire ici car un SUBPROCESS ne peut pas nous
+    /// renvoyer directement le port qu'il a choisi.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind port libre").local_addr().unwrap().port()
+    }
+
+    fn find_diamy_mxd_binary() -> PathBuf {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR fourni par cargo");
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let path = PathBuf::from(manifest_dir).join("../../target").join(profile).join("diamy-mxd");
+        assert!(
+            path.exists(),
+            "binaire diamy-mxd introuvable à {} — lance `cargo build --workspace` (ou `-p diamy-mxd`) \
+             avant ce test (ce test ne modifie ni ne recompile diamy-mxd, il l'exécute tel quel)",
+            path.display()
+        );
+        path
+    }
+
+    /// Garde un handle sur le subprocess `diamy-mxd` réel — le tue à la fin du test (`Drop`),
+    /// pour ne jamais laisser un serveur SMTP orphelin sur la machine de dev.
+    struct MxdProcess {
+        child: Child,
+    }
+    impl Drop for MxdProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    async fn spawn_mxd_subprocess(smtp_port: u16, metrics_port: u16, database_url: &str) -> MxdProcess {
+        let bin = find_diamy_mxd_binary();
+        let child = Command::new(bin)
+            .env("DIAMY_ENV", "dev")
+            .env("DATABASE_URL", database_url)
+            .env("DIAMY_MXD_SMTP_ADDR", format!("127.0.0.1:{smtp_port}"))
+            .env("DIAMY_MXD_METRICS_ADDR", format!("127.0.0.1:{metrics_port}"))
+            .env("DIAMY_MAILD_BLOB_DIR", "./blob_store")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("échec du lancement du subprocess diamy-mxd (binaire compilé ?)");
+        // Enveloppé IMMÉDIATEMENT (avant toute attente) : si le port n'ouvre jamais et qu'on
+        // panique ci-dessous, le `Drop` de `MxdProcess` tue quand même le subprocess — jamais
+        // de processus zombie orphelin sur la machine de dev.
+        let mut guard = MxdProcess { child };
+
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", smtp_port)).await.is_ok() {
+                return guard;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = guard.child.kill();
+        let _ = guard.child.wait();
+        panic!("diamy-mxd (subprocess) n'a jamais ouvert son port SMTP {smtp_port} à temps");
+    }
+
+    /// Enrôle un appareil BRIDGE pour `hugo@w3.tel` — même mécanisme que l'exemple Cargo
+    /// `enroll_bridge_device` (écrase le fichier `*.bridge.devicekey` existant s'il y en a un,
+    /// exactement comme relancer l'exemple le ferait), pour que ce test soit AUTONOME (pas de
+    /// prérequis manuel avant `cargo test`).
+    async fn ensure_bridge_device_enrolled(pool: &storage::PgPool, address: &str) {
+        let iam = DevIamClient::seeded();
+        let canonical = diamy_addr_canon(address, TenantAddressPolicy::default()).unwrap();
+        let principal = iam.resolve_principal(canonical.as_str()).unwrap();
+
+        let (identity_pub, identity_sec) = crypto::generate_identity_keypair().unwrap();
+        let (mail_pub, mail_sec) = crypto::generate_device_keypair().unwrap();
+        let device_id = Uuid::now_v7();
+        let signature = crypto::sign_manifest(&identity_sec, &mail_pub.0).unwrap();
+        storage::publish_device_bundle(
+            pool,
+            principal.id,
+            device_id,
+            &mail_pub.0,
+            &signature.0,
+            device_id,
+            &identity_pub,
+        )
+        .await
+        .unwrap();
+
+        let secret_path = bridge_dev_secret_path(canonical.as_str());
+        if let Some(dir) = secret_path.parent() {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut file_bytes = Vec::with_capacity(16 + mail_sec.as_bytes().len());
+        file_bytes.extend_from_slice(device_id.as_bytes());
+        file_bytes.extend_from_slice(mail_sec.as_bytes());
+        std::fs::write(&secret_path, &file_bytes).unwrap();
+    }
+
+    /// Enrôle un appareil DESTINATAIRE de test — même mécanisme que
+    /// `diamy-mxd::tests::enroll_device_for_test` (fichier différent, même logique : générer
+    /// les clés localement, ne publier que la clé PUBLIQUE dans `keydir`).
+    async fn enroll_recipient_device(
+        pool: &storage::PgPool,
+        principal_id: Uuid,
+    ) -> (Uuid, crypto::DeviceEncSecretKey) {
+        let (identity_pub, identity_sec) = crypto::generate_identity_keypair().unwrap();
+        let (mail_pub, mail_sec) = crypto::generate_device_keypair().unwrap();
+        let device_id = Uuid::now_v7();
+        let signature = crypto::sign_manifest(&identity_sec, &mail_pub.0).unwrap();
+        storage::publish_device_bundle(
+            pool,
+            principal_id,
+            device_id,
+            &mail_pub.0,
+            &signature.0,
+            device_id,
+            &identity_pub,
+        )
+        .await
+        .unwrap();
+        (device_id, mail_sec)
+    }
+
+    /// Cherche, parmi les messages du destinataire, celui qui déchiffre (avec NOTRE clé
+    /// d'appareil) sur un contenu contenant `marker` — jamais "le plus récent" (base partagée
+    /// entre plusieurs tests/exemples), même discipline que le reste du projet.
+    async fn find_own_message_by_marker(
+        pool: &storage::PgPool,
+        blob_store: &storage::BlobStore,
+        principal_id: Uuid,
+        device_id: Uuid,
+        device_sec: &crypto::DeviceEncSecretKey,
+        marker: &str,
+    ) -> Option<String> {
+        let messages = storage::list_recent_messages(pool, principal_id, 50).await.ok()?;
+        for summary in messages {
+            let fetched =
+                storage::fetch_message_for_device(pool, blob_store, principal_id, summary.message_id, device_id)
+                    .await
+                    .ok()?;
+            let envelope_aad = crypto::aad_for_envelope(summary.message_id, device_id);
+            let Ok(message_key) = crypto::unwrap_key(&fetched.envelope, device_sec, &envelope_aad) else {
+                continue;
+            };
+            let body_aad = crypto::aad_for_blob(summary.message_id, fetched.body_blob_id);
+            let Ok(body) = crypto::open_message(&fetched.body_ct, &message_key, &body_aad) else {
+                continue;
+            };
+            let body_str = String::from_utf8_lossy(body.as_bytes()).to_string();
+            if body_str.contains(marker) {
+                return Some(body_str);
+            }
+        }
+        None
+    }
+
+    /// Client SMTP minimal pour driver le VRAI serveur SMTP du Bridge — même esprit que
+    /// `diamy-mxd::tests::SmtpTestClient` (fichier différent, même rôle).
+    struct SmtpTestClient {
+        reader: TokioBufReader<TcpStream>,
+    }
+    impl SmtpTestClient {
+        async fn connect(addr: std::net::SocketAddr) -> Self {
+            let stream = TcpStream::connect(addr).await.expect("connexion SMTP de test");
+            Self { reader: TokioBufReader::new(stream) }
+        }
+        async fn read_line(&mut self) -> String {
+            let mut line = String::new();
+            self.reader.read_line(&mut line).await.expect("lecture ligne SMTP");
+            line.trim_end().to_string()
+        }
+        /// Lit une réponse potentiellement multi-lignes (`250-...` puis `250 ...`).
+        async fn read_response(&mut self) -> String {
+            let mut last = self.read_line().await;
+            while last.len() > 3 && last.as_bytes()[3] == b'-' {
+                last = self.read_line().await;
+            }
+            last
+        }
+        async fn cmd(&mut self, line: &str) -> String {
+            self.reader.get_mut().write_all(format!("{line}\r\n").as_bytes()).await.unwrap();
+            self.read_response().await
+        }
+        async fn send_data(&mut self, body: &str) -> String {
+            self.reader.get_mut().write_all(body.as_bytes()).await.unwrap();
+            self.reader.get_mut().write_all(b"\r\n.\r\n").await.unwrap();
+            self.read_response().await
+        }
+    }
+
+    #[tokio::test]
+    async fn full_round_trip_thunderbird_send_to_local_recipient_arrives_decryptable() {
+        let database_url = test_database_url();
+        let pool = storage::connect(&database_url).await.expect("Postgres de dev doit tourner (`docker compose up`)");
+        let blob_store = storage::BlobStore::at("./blob_store").expect("object store local");
+
+        // --- 1. Réception réelle : un VRAI processus diamy-mxd séparé, jamais modifié. ---
+        let mxd_smtp_port = free_port();
+        let mxd_metrics_port = free_port();
+        let _mxd = spawn_mxd_subprocess(mxd_smtp_port, mxd_metrics_port, &database_url).await;
+
+        // --- 2. Destinataire : cedric@w3.tel, appareil frais enrôlé par CE test. ---
+        let iam = DevIamClient::seeded();
+        let recipient_canonical = diamy_addr_canon("cedric@w3.tel", TenantAddressPolicy::default()).unwrap();
+        let recipient_principal = iam.resolve_principal(recipient_canonical.as_str()).unwrap();
+        let (recipient_device_id, recipient_device_sec) =
+            enroll_recipient_device(&pool, recipient_principal.id).await;
+
+        // --- 3. Expéditeur : le compte Bridge de démo (hugo@w3.tel), appareil auto-enrôlé. ---
+        ensure_bridge_device_enrolled(&pool, "hugo@w3.tel").await;
+
+        // --- 4. diamy-submitd : VRAI routeur, en-process, pointé vers le subprocess mxd. ---
+        let submitd_port = free_port();
+        let submitd_config = std::sync::Arc::new(diamy_submitd::SubmitdConfig {
+            local_domains: vec!["w3.tel".to_string()],
+            mxd_relay_host: "127.0.0.1".to_string(),
+            mxd_relay_port: mxd_smtp_port,
+            external_relay_port: 25,
+            helo_domain: "submit-test.w3.tel".to_string(),
+        });
+        let submitd_auth = diamy_submitd::auth::AuthState {
+            app_keys: diamy_submitd::auth::AppKeyStore::seeded_from_env(),
+            mail_jwt_secret: b"devonly_change_me_mail_jwt_secret".to_vec(),
+        };
+        let submitd_tls = diamy_submitd::generate_dev_tls_config("submit-test.w3.tel").await.unwrap();
+        let submitd_addr: std::net::SocketAddr = format!("127.0.0.1:{submitd_port}").parse().unwrap();
+        let submitd_state = diamy_submitd::SubmitState { config: submitd_config };
+        tokio::spawn(async move {
+            let _ = axum_server::bind_rustls(submitd_addr, submitd_tls)
+                .serve(diamy_submitd::router(submitd_state, submitd_auth).into_make_service())
+                .await;
+        });
+
+        // --- 5. Le Bridge : VRAI serveur SMTP, en-process, pointé vers diamy-submitd ci-dessus. ---
+        let bridge_config = Arc::new(BridgeConfig {
+            imap_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            smtp_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            imap_user: "hugo@w3.tel".to_string(),
+            imap_password: "devonly_change_me_bridge_password".to_string(),
+            sync_base: "https://127.0.0.1:0".to_string(),
+            app_key: "devonly_change_me_appkey_bridge_dev_client".to_string(),
+            submit_url: format!("https://127.0.0.1:{submitd_port}/submit"),
+        });
+        let http = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
+        let obs = Arc::new(diamy_obs::Obs::new("diamy-bridged-test"));
+        let smtp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge_smtp_addr = smtp_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _peer)) = smtp_listener.accept().await else { break };
+                let cfg = bridge_config.clone();
+                let http = http.clone();
+                let obs = obs.clone();
+                tokio::spawn(async move {
+                    let _ = handle_smtp_connection(socket, cfg, http, obs).await;
+                });
+            }
+        });
+
+        // Laisse le temps aux deux serveurs en-process de commencer à accepter (spawn est
+        // asynchrone) — court, pas une dépendance temporelle fragile : la connexion SMTP
+        // ci-dessous retentera de toute façon si besoin via le comportement normal de connect().
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // --- 6. Le "Thunderbird" de test : un VRAI client SMTP, dialogue complet avec AUTH. ---
+        let marker = format!("marker-bridge-outbound-roundtrip-{}", Uuid::now_v7());
+        let mut client = SmtpTestClient::connect(bridge_smtp_addr).await;
+        let banner = client.read_line().await;
+        assert!(banner.starts_with("220"), "bannière SMTP inattendue : {banner}");
+
+        assert!(client.cmd("EHLO thunderbird-test").await.starts_with("250"));
+
+        assert_eq!(client.cmd("AUTH LOGIN").await, "334 VXNlcm5hbWU6");
+        assert_eq!(client.cmd(&STANDARD.encode("hugo@w3.tel")).await, "334 UGFzc3dvcmQ6");
+        let auth_resp = client.cmd(&STANDARD.encode("devonly_change_me_bridge_password")).await;
+        assert!(auth_resp.starts_with("235"), "AUTH LOGIN a échoué : {auth_resp}");
+
+        assert!(client.cmd("MAIL FROM:<hugo@w3.tel>").await.starts_with("250"));
+        assert!(client.cmd("RCPT TO:<cedric@w3.tel>").await.starts_with("250"));
+        assert!(client.cmd("DATA").await.starts_with("354"));
+
+        let message = format!(
+            "From: hugo@w3.tel\r\nTo: cedric@w3.tel\r\nSubject: Round-trip demo\r\n\r\nCorps du message {marker}"
+        );
+        let data_resp = client.send_data(&message).await;
+        assert!(data_resp.starts_with("250"), "le Bridge doit accepter le relais : {data_resp}");
+
+        assert!(client.cmd("QUIT").await.starts_with("221"));
+
+        // --- 7. Vérification côté RÉCEPTION : le message existe et déchiffre correctement dans
+        //        le VRAI processus diamy-mxd séparé, via le MÊME Postgres. ---
+        let mut found = None;
+        for _ in 0..20 {
+            found = find_own_message_by_marker(
+                &pool,
+                &blob_store,
+                recipient_principal.id,
+                recipient_device_id,
+                &recipient_device_sec,
+                &marker,
+            )
+            .await;
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        let body = found.expect("le message n'est jamais arrivé côté diamy-mxd (round-trip incomplet)");
+        assert!(body.contains(&marker), "le corps déchiffré doit contenir le marqueur exact");
+    }
+
+    // --- Tests IMAP réels STORE/EXPUNGE/SELECT (A04 §3/§5.3, mission "sync réelle") ---------
+    //
+    // Ces tests pilotent le VRAI protocole texte IMAP (`handle_connection`, ce fichier) contre
+    // un VRAI subprocess `diamy-maild` séparé (même technique que `spawn_mxd_subprocess`
+    // ci-dessus) — pas d'appel direct aux fonctions `cmd_store`/`cmd_expunge`. La preuve de
+    // persistance passe par le réseau (HTTP réel vers `diamy-maild`, VRAI Postgres), jamais un
+    // raccourci en mémoire.
+
+    fn find_diamy_maild_binary() -> PathBuf {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR fourni par cargo");
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let path = PathBuf::from(manifest_dir).join("../../target").join(profile).join("diamy-maild");
+        assert!(
+            path.exists(),
+            "binaire diamy-maild introuvable à {} — lance `cargo build --workspace` (ou `-p diamy-maild`) \
+             avant ce test (ce test ne modifie ni ne recompile diamy-maild, il l'exécute tel quel)",
+            path.display()
+        );
+        path
+    }
+
+    struct MaildProcess {
+        child: Child,
+    }
+    impl Drop for MaildProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Lance un VRAI subprocess `diamy-maild` (HTTPS, certificat auto-signé de dev — comme en
+    /// prod de dev) sur un port libre. Les valeurs par défaut des AppKeys/secret JWT du service
+    /// correspondent DÉJÀ à celles attendues par la fixture de jetons pré-signés
+    /// (`tests/fixtures/dev_mail_plane_tokens.json`, secret `devonly_change_me_mail_jwt_secret`)
+    /// et par `BridgeConfig::from_env` (AppKey Bridge par défaut) : aucune variable d'env
+    /// supplémentaire à aligner.
+    async fn spawn_maild_subprocess(sync_port: u16, metrics_port: u16, database_url: &str) -> MaildProcess {
+        let bin = find_diamy_maild_binary();
+        let child = Command::new(bin)
+            .env("DIAMY_ENV", "dev")
+            .env("DATABASE_URL", database_url)
+            .env("DIAMY_MAILD_SYNC_ADDR", format!("127.0.0.1:{sync_port}"))
+            .env("DIAMY_MAILD_METRICS_ADDR", format!("127.0.0.1:{metrics_port}"))
+            .env("DIAMY_MAILD_BLOB_DIR", "./blob_store")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("échec du lancement du subprocess diamy-maild (binaire compilé ?)");
+        let mut guard = MaildProcess { child };
+
+        // Le port HTTPS n'accepte qu'une fois le certificat de dev généré ET le routeur monté —
+        // même stratégie de polling que `spawn_mxd_subprocess` (le port SMTP, lui, ouvre plus tôt).
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", sync_port)).await.is_ok() {
+                return guard;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = guard.child.kill();
+        let _ = guard.child.wait();
+        panic!("diamy-maild (subprocess) n'a jamais ouvert son port de sync {sync_port} à temps");
+    }
+
+    /// Scelle et catalogue directement un message pour le compte Bridge de démo (contourne
+    /// SMTP/diamy-mxd, hors périmètre de ce test) — sous l'enveloppe du device BRIDGE déjà
+    /// enrôlé (`ensure_bridge_device_enrolled`), exactement le device que `diamy-bridged`
+    /// utilisera pour déchiffrer via IMAP.
+    async fn store_message_for_bridge(
+        pool: &storage::PgPool,
+        blob_store: &storage::BlobStore,
+        principal_id: Uuid,
+        domain_alabel: &str,
+        bridge_device_id: Uuid,
+        marker: &str,
+    ) -> Uuid {
+        let plaintext = format!("Subject: test\r\n\r\nCorps {marker}");
+        let message_id = Uuid::now_v7();
+        let body_blob_id = Uuid::now_v7();
+        let (body_ct, message_key) =
+            crypto::seal_message(plaintext.as_bytes(), &crypto::aad_for_blob(message_id, body_blob_id)).unwrap();
+        // A20-IMAP-2 : le Sujet est scellé sous le MÊME `message_key` que le corps (AAD
+        // distincte) — c'est ce que `fetch_and_decrypt` du Bridge attend réellement pour
+        // déchiffrer `summary_ct` (contrairement au `store_test_message` de `sync_api.rs`, qui
+        // ne vérifie jamais le résumé et peut se permettre une clé indépendante aussitôt jetée).
+        let summary_ct = crypto::seal_message_with_key(b"[resume]", &message_key, &crypto::aad_for_summary(message_id)).unwrap();
+
+        let devices = storage::active_device_keys(pool, principal_id).await.unwrap();
+        let (_, mlkem_pub) = devices.into_iter().find(|(id, _)| *id == bridge_device_id).unwrap();
+        let envelope = crypto::wrap_key_for_device(
+            &message_key,
+            &crypto::DeviceEncPublicKey(mlkem_pub),
+            &crypto::aad_for_envelope(message_id, bridge_device_id),
+        )
+        .unwrap();
+        drop(message_key);
+
+        let (folder_name_ct, folder_key) =
+            crypto::seal_message(b"Inbox", b"mailfolder-placeholder:not-a02-modeled").unwrap();
+        drop(folder_key);
+        let tenant_id = diamy_mail_iam::derive_dev_tenant_id(domain_alabel);
+        let folder_id =
+            storage::ensure_inbox_folder(pool, principal_id, tenant_id, &folder_name_ct.bytes).await.unwrap();
+
+        storage::store_inbound_message(
+            pool,
+            blob_store,
+            &storage::InboundMessage {
+                message_id,
+                body_blob_id,
+                principal_id,
+                tenant_id,
+                folder_id,
+                sender_canonical: "expediteur.test@example.fr",
+                recipient_canonical: "hugo@w3.tel",
+                body_ct: &body_ct,
+                summary_ct: &summary_ct,
+                size_bytes: plaintext.len() as i64,
+                envelopes: &[(bridge_device_id, &envelope)],
+                trust_metadata: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Client IMAP texte minimal pour driver le VRAI serveur du Bridge — même esprit que
+    /// `SmtpTestClient` ci-dessus. Ne connaît RIEN du protocole au-delà de lire/écrire des
+    /// lignes CRLF : le test lui-même assert sur le contenu exact des réponses.
+    struct ImapTestClient {
+        reader: TokioBufReader<TcpStream>,
+    }
+    impl ImapTestClient {
+        async fn connect(addr: std::net::SocketAddr) -> Self {
+            let stream = TcpStream::connect(addr).await.expect("connexion IMAP de test");
+            Self { reader: TokioBufReader::new(stream) }
+        }
+        async fn read_line(&mut self) -> String {
+            let mut line = String::new();
+            self.reader.read_line(&mut line).await.expect("lecture ligne IMAP");
+            line.trim_end().to_string()
+        }
+        /// Envoie une commande taguée et collecte toutes les lignes (untagged incluses)
+        /// jusqu'à la ligne taguée `OK`/`NO`/`BAD` correspondante.
+        async fn cmd(&mut self, tag: &str, line: &str) -> Vec<String> {
+            self.reader.get_mut().write_all(format!("{tag} {line}\r\n").as_bytes()).await.unwrap();
+            let mut lines = Vec::new();
+            loop {
+                let l = self.read_line().await;
+                let is_tagged = l.starts_with(&format!("{tag} "));
+                lines.push(l);
+                if is_tagged {
+                    break;
+                }
+            }
+            lines
+        }
+    }
+
+    /// Preuve n°3 de la mission (bridge IMAP réel) : `STORE` marque `\Seen`/`\Deleted` via de
+    /// VRAIS appels réseau à `diamy-maild` (pas un cache local), `FETCH FLAGS` depuis la MÊME
+    /// session le confirme, `EXPUNGE` purge réellement le message (réponse non taguée
+    /// `* n EXPUNGE`), et un second `SELECT` — donc une nouvelle interrogation réseau du
+    /// catalogue — montre `0 EXISTS` : la suppression est persistée côté serveur, pas locale à
+    /// la session Bridge.
+    #[tokio::test]
+    async fn imap_store_and_expunge_round_trip_against_real_maild() {
+        let database_url = test_database_url();
+        let pool = storage::connect(&database_url).await.expect("Postgres de dev doit tourner (`docker compose up`)");
+        let blob_store = storage::BlobStore::at("./blob_store").expect("object store local");
+
+        // --- 1. VRAI subprocess diamy-maild, sur des ports LIBRES (jamais le port fixe par
+        //        défaut, au cas où une instance de dev tournerait déjà dessus). ---
+        let maild_port = free_port();
+        let maild_metrics_port = free_port();
+        let _maild = spawn_maild_subprocess(maild_port, maild_metrics_port, &database_url).await;
+
+        // --- 2. Compte Bridge de démo (hugo@w3.tel), appareil BRIDGE enrôlé par ce test. ---
+        ensure_bridge_device_enrolled(&pool, "hugo@w3.tel").await;
+        let iam = DevIamClient::seeded();
+        let principal = iam.resolve_principal("hugo@w3.tel").unwrap();
+        let (bridge_device_id, _bridge_device_sec) =
+            load_device_secret(&bridge_dev_secret_path("hugo@w3.tel")).expect("clé Bridge chargeable après enrôlement");
+
+        // --- 3. Un message frais, catalogué directement (SMTP hors périmètre de ce test). ---
+        let marker = format!("marker-imap-store-expunge-{}", Uuid::now_v7());
+        let message_id = store_message_for_bridge(
+            &pool, &blob_store, principal.id, principal.address.domain_alabel(), bridge_device_id, &marker,
+        )
+        .await;
+
+        // --- 4. Le Bridge : VRAI serveur IMAP, en-process, pointé vers le subprocess maild. ---
+        let bridge_config = Arc::new(BridgeConfig {
+            imap_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            smtp_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            imap_user: "hugo@w3.tel".to_string(),
+            imap_password: "devonly_change_me_bridge_password".to_string(),
+            sync_base: format!("https://127.0.0.1:{maild_port}"),
+            app_key: "devonly_change_me_appkey_bridge_dev_client".to_string(),
+            submit_url: "https://127.0.0.1:0/submit".to_string(), // non utilisé par ce test (pas d'envoi)
+        });
+        let http = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
+        let obs = Arc::new(diamy_obs::Obs::new("diamy-bridged-imap-test"));
+        let imap_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let imap_addr = imap_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _peer)) = imap_listener.accept().await else { break };
+                let cfg = bridge_config.clone();
+                let http = http.clone();
+                let obs = obs.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(socket, cfg, http, obs).await;
+                });
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // --- 5. Le dialogue IMAP réel. ---
+        let mut client = ImapTestClient::connect(imap_addr).await;
+        let greeting = client.read_line().await;
+        assert!(greeting.starts_with("* OK"), "bannière IMAP inattendue : {greeting}");
+
+        let login = client.cmd("a1", "LOGIN hugo@w3.tel devonly_change_me_bridge_password").await;
+        assert!(login.last().unwrap().starts_with("a1 OK"), "LOGIN a échoué : {login:?}");
+
+        let select1 = client.cmd("a2", "SELECT INBOX").await;
+        assert!(
+            select1.iter().any(|l| l.contains("EXISTS")),
+            "SELECT doit annoncer EXISTS : {select1:?}"
+        );
+        assert!(
+            select1.iter().any(|l| l.contains("PERMANENTFLAGS") && l.contains("\\Seen") && l.contains("\\Deleted")),
+            "PERMANENTFLAGS doit annoncer \\Seen et \\Deleted (A04 §5.3 réel) : {select1:?}"
+        );
+        let tagged1 = select1.last().unwrap();
+        assert!(tagged1.contains("[READ-WRITE]"), "SELECT ne doit plus renvoyer [READ-ONLY] : {tagged1}");
+
+        // Retrouve le numéro de séquence (1..N) de NOTRE message via son UID — le seul autre
+        // message potentiellement présent serait celui d'un AUTRE test partageant la même base
+        // (discipline d'isolation du projet : jamais de TRUNCATE) ; UID FETCH ... RFC822.SIZE
+        // ne suffit pas à identifier le nôtre, donc on énumère 1..count et on repère celui dont
+        // le FETCH BODY contient notre marqueur.
+        let count: u32 = {
+            let line = select1.iter().find(|l| l.contains("EXISTS")).unwrap();
+            line.split_whitespace().nth(1).unwrap().parse().unwrap()
+        };
+        let mut our_seq = None;
+        for seq in 1..=count {
+            let fetch = client.cmd("a3", &format!("FETCH {seq} (BODY[])")).await;
+            if fetch.iter().any(|l| l.contains(&marker)) {
+                our_seq = Some(seq);
+                break;
+            }
+        }
+        let our_seq = our_seq.expect("notre message doit apparaître dans la boîte fraîchement sélectionnée");
+
+        // --- 6. STORE +FLAGS (\Seen) : VRAI appel réseau à /state/flags, pas un cache local. ---
+        let store_seen = client.cmd("a4", &format!("STORE {our_seq} +FLAGS (\\Seen)")).await;
+        assert!(
+            store_seen.iter().any(|l| l.contains("FETCH") && l.contains("\\Seen")),
+            "STORE non-SILENT doit renvoyer la réponse FETCH avec le nouveau flag : {store_seen:?}"
+        );
+        assert!(store_seen.last().unwrap().starts_with("a4 OK"));
+
+        // FETCH FLAGS depuis la MÊME session confirme \Seen (déjà mis à jour en cache session,
+        // mais provient bien de la réponse serveur du STORE ci-dessus, pas d'une valeur inventée).
+        let fetch_flags = client.cmd("a5", &format!("FETCH {our_seq} (FLAGS)")).await;
+        assert!(fetch_flags.iter().any(|l| l.contains("\\Seen")), "FETCH FLAGS doit refléter \\Seen : {fetch_flags:?}");
+
+        // --- 7. STORE +FLAGS (\Deleted) puis EXPUNGE : purge réelle. ---
+        let store_deleted = client.cmd("a6", &format!("STORE {our_seq} +FLAGS (\\Deleted)")).await;
+        assert!(store_deleted.iter().any(|l| l.contains("\\Deleted")), "STORE \\Deleted : {store_deleted:?}");
+
+        // `cmd_expunge` purge à raison TOUS les messages `\Deleted` de la boîte, pas seulement
+        // le nôtre — sur la base de dev PARTAGÉE (jamais de TRUNCATE, discipline du projet),
+        // d'anciens messages `\Deleted` non purgés d'exécutions antérieures de ce même test
+        // PEUVENT coexister avec le nôtre. On n'assert donc PAS un numéro de séquence exact
+        // (qui dépend du nombre total purgé dans CE passage) : au moins une réponse EXPUNGE non
+        // taguée doit sortir, et la preuve que NOTRE message a bien disparu vient du SELECT frais
+        // + de la vérification directe en base ci-dessous, jamais d'un décompte de séquence.
+        let expunge = client.cmd("a7", "EXPUNGE").await;
+        assert!(
+            expunge.iter().any(|l| l.trim().ends_with(" EXPUNGE")),
+            "EXPUNGE doit émettre au moins une réponse non taguée \"* n EXPUNGE\" : {expunge:?}"
+        );
+        assert!(expunge.last().unwrap().starts_with("a7 OK"));
+
+        // --- 8. Nouveau SELECT (nouvelle requête réseau, pas un état de session) : le message
+        //        ne doit plus apparaître — preuve de persistance côté serveur. ---
+        let select2 = client.cmd("a8", "SELECT INBOX").await;
+        let count2: u32 = {
+            let line = select2.iter().find(|l| l.contains("EXISTS")).unwrap();
+            line.split_whitespace().nth(1).unwrap().parse().unwrap()
+        };
+        assert!(
+            count2 < count,
+            "au moins un message (dont le nôtre) doit avoir disparu d'un SELECT frais après EXPUNGE (avant={count}, après={count2})"
+        );
+
+        // --- 9. Preuve indépendante, directement en base (pas seulement via le protocole
+        //        IMAP) : la ligne catalogue a bien disparu de Postgres. ---
+        let remaining = storage::list_recent_messages(&pool, principal.id, 50).await.unwrap();
+        assert!(
+            !remaining.iter().any(|m| m.message_id == message_id),
+            "le message purgé ne doit plus exister dans mail.messages (A02-DEL-1)"
+        );
+
+        let _ = client.cmd("a9", "LOGOUT").await;
     }
 }

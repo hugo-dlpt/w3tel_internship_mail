@@ -13,6 +13,7 @@ uuid.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 # Uniquement pour les exemples `enroll_test_device`/`read_test_mail` (simulent un CLIENT,

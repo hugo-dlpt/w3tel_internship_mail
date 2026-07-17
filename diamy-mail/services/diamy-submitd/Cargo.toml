@@ -3,9 +3,35 @@ name = "diamy-submitd"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true
-description = "Envoi sortant : DKIM, rate limit, réputation (A10). Squelette."
+description = "Envoi sortant (A10) — relais SMTP minimal de démo consommé par le Bridge (A20-SMTP-1)."
+
+[lib]
+name = "diamy_submitd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "diamy-submitd"
+path = "src/main.rs"
 
 [dependencies]
 diamy-mail-crypto = { path = "../../crates/diamy-mail-crypto" }
+diamy-mail-iam = { path = "../../crates/diamy-mail-iam" }
+diamy-addr = { path = "../../crates/diamy-addr" }
 diamy-obs = { path = "../../crates/diamy-obs" }
+tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+base64.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+# Tests d'intégration uniquement : client HTTPS réel (`reqwest`) + un "faux MTA" local
+# (`relay.rs`) pour prouver le dialogue SMTP sortant sans dépendre d'Internet.
+reqwest.workspace = true

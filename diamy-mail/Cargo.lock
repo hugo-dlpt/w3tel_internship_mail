@@ -446,17 +446,22 @@ dependencies = [
 name = "diamy-bridged"
 version = "0.0.1"
 dependencies = [
+ "axum-server",
  "base64 0.22.1",
  "diamy-addr",
  "diamy-mail-crypto",
  "diamy-mail-iam",
+ "diamy-mail-storage",
  "diamy-obs",
+ "diamy-submitd",
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -526,6 +531,7 @@ dependencies = [
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -588,9 +594,23 @@ dependencies = [
 name = "diamy-submitd"
 version = "0.0.1"
 dependencies = [
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "diamy-addr",
  "diamy-mail-crypto",
+ "diamy-mail-iam",
  "diamy-obs",
+ "rcgen",
+ "reqwest",
+ "rustls 0.23.41",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
  "tracing",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

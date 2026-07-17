@@ -22,7 +22,8 @@ conception introduit ici doit être répercuté dans l'annexe propriétaire (gui
 - **`diamy-mxd`** : **démo du chemin vertical** (frontière → parse MIME → stockage chiffré → sync → déchiffrement vérifié), vrai SMTP (STARTTLS) sur `:2525`, persistance Postgres réelle, **file de hold** (A01-HOLD, ferme A17-DIR-5) avec balayage de release périodique, endpoint `/metrics` sur `:9102` (compteurs/jauges réels branchés sur le pipeline).
 - **`diamy-maild`** : API de sync HTTPS authentifiée (AppKey Tier 2 + jeton mail-plane) + endpoint `/metrics` (`:9101`) + garde-fou crypto au boot.
 - **Dashboard Grafana** (`deploy/grafana/`) : datasource Prometheus + dashboard "Diamy Mail" provisionnés AUTOMATIQUEMENT au démarrage — aucun clic dans l'UI, `docker compose up` suffit (débit SMTP par résultat, profondeur de la file de hold, relâchements/purges, cibles up).
-- **`diamy-submitd`** : squelette (A10).
+- **`diamy-bridged`** : Bridge IMAP/SMTP local (A20) pour clients tiers (Thunderbird) — loopback uniquement (A20-ARCH-2/NET-1/2/3), lecture IMAP + envoi SMTP (voir `diamy-submitd` juste en dessous ; A20-SMTP-1 : le Bridge délègue TOUJOURS l'émission, il ne relaie jamais lui-même vers Internet).
+- **`diamy-submitd`** : `POST /submit` (A10 §2/A20-SMTP-1), tranche démo minimale — authentification à deux facteurs, VRAI dialogue SMTP sortant par destinataire, réinjection dans `diamy-mxd` pour les domaines locaux (boucle fermée de démo). PAS de DKIM/SPF-DKIM-DMARC/rate-limiting/pools d'envoi/copie Envoyés/retry-DSN (voir `SIMPLIFICATIONS.md` pour le détail exact).
 
 ## Démarrer
 
@@ -43,6 +44,10 @@ cargo run -p diamy-maild
 docker compose up -d
 # -> Grafana sur http://localhost:3001 (admin / devonly_change_me), dashboard "Diamy Mail"
 # -> Prometheus sur http://localhost:9091/targets (diamy-maild + diamy-mxd doivent être "up")
+
+# 6. Chemin sortant (A10/A20-SMTP-1) — envoi depuis Thunderbird via le Bridge
+cargo run -p diamy-submitd   # POST /submit sur 127.0.0.1:8446 (HTTPS)
+cargo run -p diamy-bridged   # IMAP sur 127.0.0.1:1143 + SMTP sur 127.0.0.1:1587 (voir DEMO_GUIDE.md)
 ```
 
 Le garde-fou *fail-closed* se vérifie ainsi (le backend dev doit refuser un env non-dev) :
